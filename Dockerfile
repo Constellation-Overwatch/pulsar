@@ -1,6 +1,7 @@
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY internal/ internal/
 RUN go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
@@ -10,5 +11,6 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=build /pulsar /app/pulsar
-COPY config/ /app/config/
+RUN mkdir -p /app/config
+COPY config/fleet.example.yaml /app/config/fleet.example.yaml
 ENTRYPOINT ["/app/pulsar"]

@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.env
+bin/
+tmp/
+data/
+docs/
+scripts/
+*.md
+*.jpg
+microlith
+LICENSE
+Taskfile.yml
+.goreleaser.yaml

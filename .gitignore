@@ -6,5 +6,5 @@ bin/
 data/*.onnx
 data/*.pt
 snapshot.jpg
-microlith
+/microlith
 .claude/settings.local.json
