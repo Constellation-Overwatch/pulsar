@@ -1,0 +1,10 @@
+.env
+tmp/
+config/c4.json
+config/fleet.yaml
+bin/
+data/*.onnx
+data/*.pt
+snapshot.jpg
+microlith
+.claude/settings.local.json

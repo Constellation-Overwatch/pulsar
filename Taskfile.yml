@@ -1,0 +1,223 @@
+version: "3"
+
+vars:
+  BINARY_NAME: pulsar
+  DOCKER_IMAGE: pulsar:latest
+  MODEL_VARIANT: yolo26s
+  ONNX_LIB:
+    sh: |
+      if [ -f /opt/homebrew/lib/libonnxruntime.dylib ]; then
+        echo "/opt/homebrew/lib/libonnxruntime.dylib"
+      elif [ -f /usr/local/lib/libonnxruntime.so ]; then
+        echo "/usr/local/lib/libonnxruntime.so"
+      else
+        echo ""
+      fi
+  ENTITY_ID:
+    sh: python3 -c "import json; print(json.load(open('config/c4.json'))['entities'][0]['entity_id'])" 2>/dev/null || echo ""
+
+tasks:
+  # ── Core ────────────────────────────────────────────────────────────
+  build:
+    desc: Build the binary (no detection)
+    cmds:
+      - echo "Building {{.BINARY_NAME}}..."
+      - go build -o bin/{{.BINARY_NAME}} ./cmd/microlith
+
+  run:
+    desc: Run the binary (no detection)
+    deps: [build]
+    cmds:
+      - echo "Running {{.BINARY_NAME}}..."
+      - ./bin/{{.BINARY_NAME}}
+
+  dev:
+    desc: Build and run in development mode (no detection)
+    cmds:
+      - echo "Starting {{.BINARY_NAME}} in dev mode..."
+      - go run ./cmd/microlith
+
+  # ── Detection Build ─────────────────────────────────────────────────
+  build:detection:
+    desc: Build with CV detection + device capture enabled
+    cmds:
+      - echo "Building {{.BINARY_NAME}} with detection tag..."
+      - CGO_ENABLED=1 go build -tags detection -o bin/{{.BINARY_NAME}} ./cmd/microlith
+      - echo "Built bin/{{.BINARY_NAME}} (detection enabled)"
+
+  ensure:model:
+    desc: Download YOLO26 ONNX if not present
+    status:
+      - test -f data/{{.MODEL_VARIANT}}.onnx
+    cmds:
+      - task: setup:model
+
+  run:detection:
+    desc: Run with detection (camera + YOLO26 inference)
+    deps: [build:detection, ensure:model]
+    env:
+      MODEL_PATH: data/{{.MODEL_VARIANT}}.onnx
+      ONNX_LIB_PATH: "{{.ONNX_LIB}}"
+      MODEL_FORMAT: e2e
+    cmds:
+      - echo "Running {{.BINARY_NAME}} with detection..."
+      - ./bin/{{.BINARY_NAME}}
+
+  dev:detection:
+    desc: Dev mode with detection (camera + YOLO26)
+    deps: [ensure:model]
+    env:
+      MODEL_PATH: data/{{.MODEL_VARIANT}}.onnx
+      ONNX_LIB_PATH: "{{.ONNX_LIB}}"
+      MODEL_FORMAT: e2e
+    cmds:
+      - CGO_ENABLED=1 go run -tags detection ./cmd/microlith
+
+  # ── Setup ───────────────────────────────────────────────────────────
+  setup:deps:
+    desc: Install detection dependencies (OpenCV, ONNX Runtime) via Homebrew
+    platforms: [darwin]
+    cmds:
+      - echo "Installing OpenCV (for GoCV)..."
+      - brew install opencv
+      - echo "Installing ONNX Runtime..."
+      - brew install onnxruntime
+      - echo ""
+      - echo "Dependencies installed. Next run task setup:model"
+
+  setup:model:
+    desc: "Download pre-exported YOLO26 ONNX from HuggingFace (no pip needed)"
+    vars:
+      VARIANT: '{{.CLI_ARGS | default .MODEL_VARIANT}}'
+    cmds:
+      - mkdir -p data
+      - echo "Downloading {{.VARIANT}}.onnx from HuggingFace (onnx-community)..."
+      - curl -L --progress-bar -o data/{{.VARIANT}}.onnx "https://huggingface.co/onnx-community/{{.VARIANT}}-ONNX/resolve/main/onnx/model.onnx"
+      - echo "Saved data/{{.VARIANT}}.onnx ($(du -h data/{{.VARIANT}}.onnx | cut -f1))"
+
+  setup:model:export:
+    desc: "Export YOLO26 via ultralytics (pip + PyTorch, custom variants)"
+    cmds:
+      - pip3 install --quiet ultralytics
+      - python3 scripts/export_yolo26.py {{.CLI_ARGS | default .MODEL_VARIANT}}
+
+  setup:all:
+    desc: Full detection setup (deps + model)
+    cmds:
+      - task: setup:deps
+      - task: setup:model
+
+  # ── MediaMTX (WebRTC/HLS) ───────────────────────────────────────────
+  mediamtx:
+    desc: Run MediaMTX RTSP/WebRTC/HLS server (needed for browser video)
+    cmds:
+      - echo "Starting MediaMTX (RTSP :8554, WebRTC :8889, HLS :8888, API :9997)"
+      - echo "  WebRTC player → http://localhost:8889/{{.ENTITY_ID}}"
+      - mediamtx
+
+  setup:mediamtx:
+    desc: Install MediaMTX via Homebrew (macOS)
+    platforms: [darwin]
+    cmds:
+      - brew install mediamtx
+      - echo "MediaMTX installed. Run 'task mediamtx' in a separate terminal."
+
+  # ── Testing Video ───────────────────────────────────────────────────
+  test:video:
+    desc: Play raw RTSP stream for first entity (requires ffplay)
+    cmds:
+      - '[ -n "{{.ENTITY_ID}}" ] || { echo "No entity in config/c4.json. Run pulsar first."; exit 1; }'
+      - echo "Playing rtsp://localhost:8554/{{.ENTITY_ID}}"
+      - echo "  (Ctrl+C to stop)"
+      - ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay rtsp://localhost:8554/{{.ENTITY_ID}}
+
+  test:overlay:
+    desc: Play detection overlay stream (/{entity_id}/pulsar)
+    cmds:
+      - '[ -n "{{.ENTITY_ID}}" ] || { echo "No entity in config/c4.json. Run pulsar first."; exit 1; }'
+      - echo "Playing rtsp://localhost:8554/{{.ENTITY_ID}}/pulsar (overlay)"
+      - echo "  (Ctrl+C to stop)"
+      - ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay rtsp://localhost:8554/{{.ENTITY_ID}}/pulsar
+
+  test:webrtc:
+    desc: Open WebRTC player in browser (requires MediaMTX running)
+    cmds:
+      - '[ -n "{{.ENTITY_ID}}" ] || { echo "No entity in config/c4.json. Run pulsar first."; exit 1; }'
+      - echo "Opening http://localhost:8889/{{.ENTITY_ID}}"
+      - open "http://localhost:8889/{{.ENTITY_ID}}" 2>/dev/null || xdg-open "http://localhost:8889/{{.ENTITY_ID}}" 2>/dev/null || echo "Open http://localhost:8889/{{.ENTITY_ID}} in your browser"
+
+  test:snapshot:
+    desc: Grab a single frame from entity RTSP stream as snapshot.jpg
+    cmds:
+      - '[ -n "{{.ENTITY_ID}}" ] || { echo "No entity in config/c4.json. Run pulsar first."; exit 1; }'
+      - echo "Grabbing snapshot from rtsp://localhost:8554/{{.ENTITY_ID}}..."
+      - ffmpeg -y -rtsp_transport tcp -i rtsp://localhost:8554/{{.ENTITY_ID}} -frames:v 1 snapshot.jpg
+      - echo "Saved snapshot.jpg"
+      - open snapshot.jpg 2>/dev/null || xdg-open snapshot.jpg 2>/dev/null || echo "Open snapshot.jpg manually"
+
+  test:check:
+    desc: Verify detection dependencies are available
+    cmds:
+      - echo "=== Detection Dependency Check ==="
+      - |
+        echo -n "  OpenCV:       "
+        pkg-config --modversion opencv4 2>/dev/null || echo "NOT FOUND (brew install opencv)"
+      - |
+        echo -n "  ONNX Runtime: "
+        if [ -f "{{.ONNX_LIB}}" ]; then echo "{{.ONNX_LIB}}"; else echo "NOT FOUND (brew install onnxruntime)"; fi
+      - |
+        echo -n "  YOLO26 Model: "
+        if [ -f data/{{.MODEL_VARIANT}}.onnx ]; then echo "data/{{.MODEL_VARIANT}}.onnx ($(du -h data/{{.MODEL_VARIANT}}.onnx | cut -f1))"; else echo "NOT FOUND (task setup:model)"; fi
+      - |
+        echo -n "  ffplay:       "
+        which ffplay 2>/dev/null || echo "NOT FOUND (brew install ffmpeg)"
+      - |
+        echo -n "  Python:       "
+        python3 --version 2>/dev/null || echo "NOT FOUND"
+      - |
+        echo -n "  ultralytics:  "
+        python3 -c "import ultralytics; print(ultralytics.__version__)" 2>/dev/null || echo "NOT FOUND (pip3 install ultralytics)"
+      - echo ""
+      - |
+        echo -n "  Build test:   "
+        if CGO_ENABLED=1 go build -tags detection -o /dev/null ./cmd/microlith 2>/dev/null; then
+          echo "PASS (detection tag compiles)"
+        else
+          echo "FAIL (detection tag does not compile)"
+        fi
+
+  # ── Docker ──────────────────────────────────────────────────────────
+  docker-build:
+    desc: Build Docker image (no detection)
+    cmds:
+      - echo "Building Docker image..."
+      - docker build -t {{.DOCKER_IMAGE}} .
+
+  docker-run:
+    desc: Start services with Docker Compose
+    cmds:
+      - echo "Starting services with Docker Compose..."
+      - docker-compose up -d
+
+  docker-stop:
+    desc: Stop Docker Compose services
+    cmds:
+      - echo "Stopping services..."
+      - docker-compose down
+
+  # ── Other ───────────────────────────────────────────────────────────
+  test-relay:
+    desc: Synthetic MAVLink relay test (reads c4.json, sends packets, verifies KV)
+    cmds:
+      - ./scripts/mavlink-relay.sh {{.CLI_ARGS}}
+
+  clean:
+    desc: Clean up build artifacts
+    cmds:
+      - echo "Cleaning up..."
+      - rm -rf bin/ snapshot.jpg
+
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list

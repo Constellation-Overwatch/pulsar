@@ -1,0 +1,46 @@
+# Pulsar Fleet Configuration Example
+# Copy this file to fleet.yaml and edit to match your setup.
+# Or delete fleet.yaml and run Pulsar for guided setup.
+
+organization:
+  name: "Field Ops Station"
+  type: "civilian"
+  description: "Multi-platform ground control station"
+
+entities:
+  # ── Aerial Platform ──────────────────────────────────────────────
+  - name: "Recon Drone"
+    type: "uav"
+    priority: "high"
+    status: "active"
+    mavlink: true                        # auto-assigned UDP port
+    video_config:
+      protocol: "rtsp"
+      port: 8554
+      source: "rtsp://10.0.0.50:554/cam1"   # onboard camera RTSP feed
+
+  # ── Ground Robot ─────────────────────────────────────────────────
+  - name: "Patrol Robot"
+    type: "ground_vehicle"
+    priority: "normal"
+    status: "active"
+    mavlink: true                        # auto-assigned next UDP port
+    video_config:
+      protocol: "rtsp"
+      port: 8554
+      source: "rtsp://admin:pass@10.0.0.60:554/stream"  # authenticated camera
+
+  # ── Fixed Sensor (no MAVLink) ────────────────────────────────────
+  - name: "Perimeter Camera"
+    type: "isr_sensor"
+    priority: "low"
+    status: "active"
+    video_config:
+      protocol: "rtsp"
+      port: 8554
+      # Device capture (GoCV/OpenCV):
+      #   Linux:  device: "/dev/video0"         (V4L2 path)
+      #   macOS:  device: "0"                   (AVFoundation index)
+      # Run `ffmpeg -f avfoundation -list_devices true -i ""` on macOS
+      # to find available device indices.
+      device: "/dev/video0"
