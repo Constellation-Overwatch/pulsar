@@ -1,133 +1,120 @@
-//go:build detection
-
 package video
 
 import (
+	"context"
 	"fmt"
+	"image"
+	"io"
+	"os/exec"
+	"strconv"
 	"sync"
-	"time"
 
 	"github.com/Constellation-Overwatch/pulsar/pkg/services/logger"
-
-	"github.com/bluenviron/gortsplib/v5"
-	"github.com/bluenviron/gortsplib/v5/pkg/description"
-	"github.com/bluenviron/gortsplib/v5/pkg/format"
-	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
-	"gocv.io/x/gocv"
 )
 
-// OverlayWriter publishes annotated H264 frames to an RTSP server.
-// It automatically reconnects if the connection drops.
+// OverlayWriter publishes annotated H264 frames to an RTSP path via ffmpeg.
+// Raw RGB24 frames are piped to ffmpeg's stdin; ffmpeg encodes and publishes
+// directly to the RTSP server (MediaMTX or embedded). This eliminates the
+// pipe deadlock, SPS/PPS initialization, and RTP packetization issues from
+// the previous gortsplib-based approach.
 type OverlayWriter struct {
-	mu      sync.Mutex
-	client  *gortsplib.Client
-	desc    *description.Session
-	forma   *format.H264
-	rtpEnc  *rtph264.Encoder
-	h264enc *H264Encoder
-	start   time.Time
-	closed  bool
-
-	// reconnect state
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	closed   bool
+	width    int
+	height   int
+	ctx      context.Context
 	rtspURL  string
 	failures int
 }
 
-// NewOverlayWriter creates a new overlay publisher that pushes H264 to
-// rtsp://{rtspHost}:{rtspPort}/{entityID}/pulsar.
-func NewOverlayWriter(entityID, rtspHost string, rtspPort int) (*OverlayWriter, error) {
+// NewOverlayWriter creates a new overlay publisher that uses ffmpeg to push
+// H264 to rtsp://{rtspHost}:{rtspPort}/{entityID}/pulsar.
+func NewOverlayWriter(ctx context.Context, entityID, rtspHost string, rtspPort int) (*OverlayWriter, error) {
 	url := fmt.Sprintf("rtsp://%s:%d/%s/pulsar", rtspHost, rtspPort, entityID)
 
-	h264enc, err := NewH264Encoder(captureWidth, captureHeight, captureFPS)
-	if err != nil {
-		return nil, fmt.Errorf("h264 encoder: %w", err)
-	}
-
 	w := &OverlayWriter{
+		ctx:     ctx,
 		rtspURL: url,
-		h264enc: h264enc,
-		forma: &format.H264{
-			PayloadTyp:        96,
-			PacketizationMode: 1,
-		},
-	}
-	w.desc = &description.Session{
-		Medias: []*description.Media{{
-			Type:    description.MediaTypeVideo,
-			Formats: []format.Format{w.forma},
-		}},
+		width:   captureWidth,
+		height:  captureHeight,
 	}
 
-	// Set initial SPS/PPS if available from encoder headers
-	if sps := h264enc.SPS(); sps != nil {
-		w.forma.SPS = sps
-		w.forma.PPS = h264enc.PPS()
-	}
-
-	if err := w.connect(); err != nil {
-		h264enc.Close()
+	if err := w.startFFmpeg(); err != nil {
 		return nil, err
 	}
 
-	logger.Infof("[overlay] publishing H264 to %s", url)
+	logger.Infof("[overlay] publishing H264 to %s via ffmpeg", url)
 	return w, nil
 }
 
-// connect establishes (or re-establishes) the RTSP recording session.
-func (w *OverlayWriter) connect() error {
-	// Force TCP interleaved transport so RTP packets flow over the same
-	// TCP connection as RTSP control. This keeps the connection alive —
-	// with UDP, the TCP control channel gets no traffic and MediaMTX's
-	// readTimeout (default 10s) kills the session.
-	proto := gortsplib.ProtocolTCP
-	c := &gortsplib.Client{
-		Protocol:     &proto,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-	if err := c.StartRecording(w.rtspURL, w.desc); err != nil {
-		return fmt.Errorf("start overlay recording at %s: %w", w.rtspURL, err)
-	}
+// startFFmpeg spawns the ffmpeg encoding/publishing subprocess.
+func (w *OverlayWriter) startFFmpeg() error {
+	args := buildOverlayArgs(w.width, w.height, w.rtspURL)
+	cmd := exec.CommandContext(w.ctx, "ffmpeg", args...)
 
-	rtpEnc, err := w.forma.CreateEncoder()
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		c.Close()
-		return fmt.Errorf("create H264 RTP encoder: %w", err)
+		return fmt.Errorf("ffmpeg stdin pipe: %w", err)
 	}
-	rtpEnc.PayloadMaxSize = 1200 // WebRTC-safe; default 1450 triggers MediaMTX remuxing
 
-	w.client = c
-	w.rtpEnc = rtpEnc
-	w.start = time.Now()
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		return fmt.Errorf("ffmpeg start: %w", err)
+	}
+
+	w.cmd = cmd
+	w.stdin = stdin
 	w.failures = 0
 	return nil
 }
 
-// reconnect closes the old client and re-establishes the session.
-func (w *OverlayWriter) reconnect() bool {
-	if w.client != nil {
-		w.client.Close()
-		w.client = nil
+// buildOverlayArgs constructs ffmpeg arguments for RGB24 stdin → H264 RTSP output.
+func buildOverlayArgs(width, height int, rtspURL string) []string {
+	return []string{
+		"-v", "warning",
+		"-f", "rawvideo",
+		"-pix_fmt", "rgb24",
+		"-s", fmt.Sprintf("%dx%d", width, height),
+		"-r", strconv.Itoa(captureFPS),
+		"-i", "pipe:0",
+		"-pix_fmt", "yuv420p",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-profile:v", "baseline",
+		"-g", strconv.Itoa(captureFPS * 2), // keyframe every 2 seconds
+		"-f", "rtsp",
+		"-rtsp_transport", "tcp",
+		rtspURL,
 	}
-	w.failures++
-	backoff := time.Duration(w.failures) * time.Second
-	if backoff > 10*time.Second {
-		backoff = 10 * time.Second
-	}
-	time.Sleep(backoff)
+}
 
-	if err := w.connect(); err != nil {
+// reconnect closes the old ffmpeg process and starts a new one.
+func (w *OverlayWriter) reconnect() bool {
+	if w.stdin != nil {
+		w.stdin.Close()
+	}
+	if w.cmd != nil && w.cmd.Process != nil {
+		w.cmd.Process.Kill()
+		w.cmd.Wait()
+	}
+
+	w.failures++
+	if err := w.startFFmpeg(); err != nil {
 		if w.failures <= 3 || w.failures%10 == 0 {
-			logger.Errorf("[overlay] reconnect to %s failed (%d): %v", w.rtspURL, w.failures, err)
+			logger.Warnf("[overlay] reconnect to %s failed (%d): %v", w.rtspURL, w.failures, err)
 		}
 		return false
 	}
+
 	logger.Infof("[overlay] reconnected to %s after %d attempts", w.rtspURL, w.failures)
 	return true
 }
 
-// WriteFrame encodes a gocv.Mat as H264 and pushes it via RTSP.
-func (w *OverlayWriter) WriteFrame(frame gocv.Mat) error {
+// WriteFrame converts an image.Image to RGB24 and pipes it to ffmpeg.
+func (w *OverlayWriter) WriteFrame(img image.Image) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -135,56 +122,53 @@ func (w *OverlayWriter) WriteFrame(frame gocv.Mat) error {
 		return fmt.Errorf("overlay writer closed")
 	}
 
-	img, err := frame.ToImage()
-	if err != nil {
-		return fmt.Errorf("mat to image: %w", err)
-	}
-
-	au, err := w.h264enc.Encode(img)
-	if err != nil {
-		return fmt.Errorf("h264 encode: %w", err)
-	}
-	if au == nil {
-		return nil // encoder buffering
-	}
-
-	// Update SPS/PPS on the format for live SDP updates
-	if sps := w.h264enc.SPS(); sps != nil {
-		w.forma.SafeSetParams(sps, w.h264enc.PPS())
-	}
-
-	pkts, err := w.rtpEnc.Encode(au)
-	if err != nil {
-		return fmt.Errorf("rtp encode: %w", err)
-	}
-
-	elapsed := time.Since(w.start)
-	ts := uint32(int64(elapsed) * int64(w.forma.ClockRate()) / int64(time.Second))
-
-	for _, pkt := range pkts {
-		pkt.Timestamp = ts
-		if err := w.client.WritePacketRTP(w.desc.Medias[0], pkt); err != nil {
-			if w.reconnect() {
-				return nil
+	frame := imageToRGB24(img, w.width, w.height)
+	if _, err := w.stdin.Write(frame); err != nil {
+		// ffmpeg may have crashed; try to restart
+		if w.reconnect() {
+			if _, err := w.stdin.Write(frame); err != nil {
+				return fmt.Errorf("write frame after reconnect: %w", err)
 			}
-			return fmt.Errorf("write rtp (disconnected): %w", err)
+			return nil
 		}
+		return fmt.Errorf("write frame (disconnected): %w", err)
 	}
 	return nil
 }
 
-// Close shuts down the RTSP connection and H264 encoder.
+// Close shuts down the ffmpeg process.
 func (w *OverlayWriter) Close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.closed {
 		w.closed = true
-		if w.client != nil {
-			w.client.Close()
+		if w.stdin != nil {
+			w.stdin.Close()
 		}
-		if w.h264enc != nil {
-			w.h264enc.Close()
+		if w.cmd != nil && w.cmd.Process != nil {
+			w.cmd.Process.Kill()
+			w.cmd.Wait()
 		}
 		logger.Info("[overlay] closed")
 	}
+}
+
+// imageToRGB24 converts an image.Image to raw RGB24 bytes at the given dimensions.
+func imageToRGB24(img image.Image, w, h int) []byte {
+	buf := make([]byte, w*h*3)
+	bounds := img.Bounds()
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			srcX := bounds.Min.X + x
+			srcY := bounds.Min.Y + y
+			if srcX < bounds.Max.X && srcY < bounds.Max.Y {
+				r, g, b, _ := img.At(srcX, srcY).RGBA()
+				off := (y*w + x) * 3
+				buf[off] = byte(r >> 8)
+				buf[off+1] = byte(g >> 8)
+				buf[off+2] = byte(b >> 8)
+			}
+		}
+	}
+	return buf
 }

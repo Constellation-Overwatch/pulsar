@@ -209,7 +209,7 @@ func TestRegister_FirstBoot_CreatesEntities(t *testing.T) {
 		},
 	}
 
-	state, err := Register(client, fleet, "nkey", "nats://test", "localhost", "localhost", nil)
+	state, err := Register(client, fleet, "nkey", "nats://test", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("Register failed: %v", err)
 	}
@@ -251,13 +251,13 @@ func TestRegister_Idempotent_DoesNotDuplicate(t *testing.T) {
 	}
 
 	// First registration
-	state1, err := Register(client, fleet, "", "", "localhost", "localhost", nil)
+	state1, err := Register(client, fleet, "", "", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
 
 	// Second registration with first state as previousState
-	state2, err := Register(client, fleet, "", "", "localhost", "localhost", state1)
+	state2, err := Register(client, fleet, "", "", "localhost", "localhost", false, state1)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestRegister_DriftDetection_UpdatesChanged(t *testing.T) {
 	}
 
 	// First registration
-	state1, err := Register(client, fleet, "", "", "localhost", "localhost", nil)
+	state1, err := Register(client, fleet, "", "", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestRegister_DriftDetection_UpdatesChanged(t *testing.T) {
 	fleet.Entities[0].Priority = "critical"
 
 	// Re-register with state tracking
-	state2, err := Register(client, fleet, "", "", "localhost", "localhost", state1)
+	state2, err := Register(client, fleet, "", "", "localhost", "localhost", false, state1)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestRegister_StaleEntityRemoval(t *testing.T) {
 	}
 
 	// Register both
-	state1, err := Register(client, fleet, "", "", "localhost", "localhost", nil)
+	state1, err := Register(client, fleet, "", "", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestRegister_StaleEntityRemoval(t *testing.T) {
 	fleet.Entities = fleet.Entities[:1]
 
 	// Re-register - should remove Drone Beta
-	state2, err := Register(client, fleet, "", "", "localhost", "localhost", state1)
+	state2, err := Register(client, fleet, "", "", "localhost", "localhost", false, state1)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestRegister_ReProvisions_MissingEntity(t *testing.T) {
 	}
 
 	// First registration
-	state1, err := Register(client, fleet, "", "", "localhost", "localhost", nil)
+	state1, err := Register(client, fleet, "", "", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestRegister_ReProvisions_MissingEntity(t *testing.T) {
 	mock.mu.Unlock()
 
 	// Re-register with previous state - should detect missing and re-create
-	state2, err := Register(client, fleet, "", "", "localhost", "localhost", state1)
+	state2, err := Register(client, fleet, "", "", "localhost", "localhost", false, state1)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestRegister_AddNewEntity(t *testing.T) {
 	}
 
 	// First registration
-	state1, err := Register(client, fleet, "", "", "localhost", "localhost", nil)
+	state1, err := Register(client, fleet, "", "", "localhost", "localhost", false, nil)
 	if err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
@@ -441,7 +441,7 @@ func TestRegister_AddNewEntity(t *testing.T) {
 	})
 
 	// Re-register
-	state2, err := Register(client, fleet, "", "", "localhost", "localhost", state1)
+	state2, err := Register(client, fleet, "", "", "localhost", "localhost", false, state1)
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}

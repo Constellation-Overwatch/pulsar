@@ -3,6 +3,7 @@ package shared
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -100,16 +101,33 @@ func PickAdvertiseHost(envOverride string) string {
 
 // FormatVideoEndpoints builds the externally-consumable video URLs for an entity.
 // WebRTC and HLS point to the /pulsar overlay (post-inference annotated stream).
-func FormatVideoEndpoints(advertiseHost string, rtspPort int, entityID string) map[string]interface{} {
+// When https is true, WebRTC/HLS URLs use https:// and rtsps:// schemes.
+func FormatVideoEndpoints(advertiseHost string, rtspPort int, entityID string, https bool) map[string]interface{} {
+	httpScheme := "http"
+	if https {
+		httpScheme = "https"
+	}
+
 	base := fmt.Sprintf("%s:%d/%s", advertiseHost, rtspPort, entityID)
 	return map[string]interface{}{
 		"protocol":    "rtsp",
 		"port":        rtspPort,
 		"stream_url":  fmt.Sprintf("rtsp://%s", base),
 		"overlay_url": fmt.Sprintf("rtsp://%s/pulsar", base),
-		"webrtc_url":  fmt.Sprintf("http://%s:8889/%s/pulsar", advertiseHost, entityID),
-		"hls_url":     fmt.Sprintf("http://%s:8888/%s/pulsar", advertiseHost, entityID),
+		"webrtc_url":  fmt.Sprintf("%s://%s:8889/%s/pulsar", httpScheme, advertiseHost, entityID),
+		"hls_url":     fmt.Sprintf("%s://%s:8888/%s/pulsar", httpScheme, advertiseHost, entityID),
 	}
+}
+
+// DeriveNATSURL extracts the hostname from a base HTTP URL and returns nats://host:4222.
+// Falls back to nats://localhost:4222 on parse failure.
+func DeriveNATSURL(baseURL string) string {
+	fallback := "nats://localhost:4222"
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Hostname() == "" {
+		return fallback
+	}
+	return fmt.Sprintf("nats://%s:4222", u.Hostname())
 }
 
 // nicPriority returns a sort key — lower is higher priority.

@@ -31,16 +31,40 @@ func main() {
 
 	apiKey := os.Getenv("C4_API_KEY")
 	baseURL := os.Getenv("C4_BASE_URL")
+
+	// Guided .env setup when required vars are missing
+	if apiKey == "" || baseURL == "" {
+		logger.Info("[pulsar] missing C4_API_KEY or C4_BASE_URL, starting .env setup...")
+		if err := guidedEnvInit(); err != nil {
+			logger.Fatalf("[pulsar] .env setup failed: %v", err)
+		}
+		// Re-read after writing .env
+		apiKey = os.Getenv("C4_API_KEY")
+		baseURL = os.Getenv("C4_BASE_URL")
+		if apiKey == "" || baseURL == "" {
+			logger.Fatal("[pulsar] C4_API_KEY and C4_BASE_URL are required. Setup incomplete.")
+		}
+	}
+
 	natsKey := os.Getenv("C4_NATS_KEY")
-	natsURL := envOr("C4_NATS_URL", "nats://localhost:4222")
+	if natsKey == "" {
+		logger.Warn("[pulsar] C4_NATS_KEY is empty — NATS streaming will fail without credentials")
+	}
+
+	// Derive NATS URL from base URL when not explicitly set
+	natsURL := os.Getenv("C4_NATS_URL")
+	if natsURL != "" {
+		logger.Infof("[pulsar] using explicit C4_NATS_URL: %s", natsURL)
+	} else {
+		natsURL = shared.DeriveNATSURL(baseURL)
+		logger.Infof("[pulsar] derived NATS URL: %s (from C4_BASE_URL)", natsURL)
+	}
+
 	fleetPath := envOr("FLEET_CONFIG", "config/fleet.yaml")
 	statePath := envOr("C4_STATE_FILE", "config/c4.json")
 	rtspHost := envOr("RTSP_HOST", "localhost")
 	advertiseHost := shared.PickAdvertiseHost(os.Getenv("ADVERTISE_HOST"))
-
-	if apiKey == "" || baseURL == "" {
-		logger.Fatal("[pulsar] C4_API_KEY and C4_BASE_URL are required. Check your .env file.")
-	}
+	advertiseHTTPS := strings.EqualFold(os.Getenv("ADVERTISE_HTTPS"), "true")
 
 	// Load or create fleet config
 	fleet, err := loadOrInitFleet(fleetPath)
@@ -64,7 +88,8 @@ func main() {
 	}
 
 	// Initial registration (entity_id-based reconciliation)
-	state, err := registry.Register(client, fleet, natsKey, natsURL, rtspHost, advertiseHost, previousState)
+	// Always force video sync on boot to ensure Overwatch DB has current endpoints
+	state, err := registry.Register(client, fleet, natsKey, natsURL, rtspHost, advertiseHost, advertiseHTTPS, previousState, registry.RegisterOptions{ForceVideoSync: true})
 	if err != nil {
 		logger.Fatalf("[pulsar] registration failed: %v", err)
 	}
@@ -93,8 +118,9 @@ func main() {
 		serviceCancel = startServices(ctx, state, pub)
 	}
 
-	// Sync loop: watch fleet.yaml for changes and re-register
-	lastHash, _ := registry.FleetConfigHash(fleetPath)
+	// Sync loop: watch fleet.yaml and .env for changes and re-register
+	lastFleetHash, _ := registry.FleetConfigHash(fleetPath)
+	lastEnvHash := registry.EnvFileHash(".env", "../.env")
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 
@@ -109,18 +135,43 @@ func main() {
 			}
 			return
 		case <-ticker.C:
-			currentHash, err := registry.FleetConfigHash(fleetPath)
+			currentFleetHash, err := registry.FleetConfigHash(fleetPath)
 			if err != nil {
 				logger.Warnf("[pulsar] could not hash fleet config: %v", err)
 				continue
 			}
 
-			if currentHash == lastHash {
+			currentEnvHash := registry.EnvFileHash(".env", "../.env")
+			fleetChanged := currentFleetHash != lastFleetHash
+			envChanged := currentEnvHash != lastEnvHash
+
+			if !fleetChanged && !envChanged {
 				continue
 			}
 
-			logger.Info("[pulsar] fleet.yaml changed, re-syncing...")
-			lastHash = currentHash
+			if envChanged {
+				logger.Info("[pulsar] .env changed, reloading environment...")
+				_ = godotenv.Overload()
+				_ = godotenv.Overload("../.env")
+
+				// Re-read all env vars
+				natsKey = os.Getenv("C4_NATS_KEY")
+				newNatsURL := os.Getenv("C4_NATS_URL")
+				if newNatsURL != "" {
+					natsURL = newNatsURL
+				} else {
+					natsURL = shared.DeriveNATSURL(os.Getenv("C4_BASE_URL"))
+				}
+				rtspHost = envOr("RTSP_HOST", "localhost")
+				advertiseHost = shared.PickAdvertiseHost(os.Getenv("ADVERTISE_HOST"))
+				advertiseHTTPS = strings.EqualFold(os.Getenv("ADVERTISE_HTTPS"), "true")
+				lastEnvHash = currentEnvHash
+			}
+
+			if fleetChanged {
+				logger.Info("[pulsar] fleet.yaml changed, re-syncing...")
+				lastFleetHash = currentFleetHash
+			}
 
 			newFleet, err := loadOrInitFleet(fleetPath)
 			if err != nil {
@@ -128,7 +179,7 @@ func main() {
 				continue
 			}
 
-			newState, err := registry.Register(client, newFleet, natsKey, natsURL, rtspHost, advertiseHost, state)
+			newState, err := registry.Register(client, newFleet, natsKey, natsURL, rtspHost, advertiseHost, advertiseHTTPS, state, registry.RegisterOptions{ForceVideoSync: envChanged})
 			if err != nil {
 				logger.Warnf("[pulsar] re-registration failed: %v", err)
 				continue
@@ -153,11 +204,19 @@ func main() {
 }
 
 func printSummary(state *shared.C4State, statePath string) {
+	scheme := "http"
+	if state.AdvertiseHTTPS {
+		scheme = "https"
+	}
 	fmt.Println()
 	fmt.Println("=== Pulsar Registration Complete ===")
-	fmt.Printf("  Pulsar ID:    %s\n", state.PulsarID)
-	fmt.Printf("  Organization: %s (%s)\n", state.OrgName, state.OrgID)
-	fmt.Printf("  Entities:     %d registered\n", len(state.Entities))
+	fmt.Printf("  Pulsar ID:      %s\n", state.PulsarID)
+	fmt.Printf("  Organization:   %s (%s)\n", state.OrgName, state.OrgID)
+	fmt.Printf("  API:            %s\n", state.APIURL)
+	fmt.Printf("  NATS:           %s\n", state.NATSURL)
+	fmt.Printf("  Advertise:      %s (%s)\n", state.AdvertiseHost, scheme)
+	fmt.Printf("  RTSP Host:      %s\n", state.RTSPHost)
+	fmt.Printf("  Entities:       %d registered\n", len(state.Entities))
 	for _, e := range state.Entities {
 		suffix := ""
 		if e.MavlinkPort > 0 {
@@ -165,7 +224,7 @@ func printSummary(state *shared.C4State, statePath string) {
 		}
 		fmt.Printf("    - %s [%s] -> %s%s\n", e.Name, e.Type, e.RTSPURL, suffix)
 	}
-	fmt.Printf("  State file:   %s\n", statePath)
+	fmt.Printf("  State file:     %s\n", statePath)
 	fmt.Println()
 }
 
@@ -188,14 +247,12 @@ func startServices(parent context.Context, state *shared.C4State, pub *publisher
 		if entity.RTSPURL == "" {
 			continue
 		}
-		ow, err := video.NewOverlayWriter(entity.EntityID, rtspHost, 8554)
+		ow, err := video.NewOverlayWriter(svcCtx, entity.EntityID, rtspHost, 8554)
 		if err != nil {
 			logger.Warnf("[pulsar] overlay writer for %s: %v (skipping overlay)", entity.Name, err)
 			continue
 		}
-		if ow != nil {
-			overlayWriters[entity.EntityID] = ow
-		}
+		overlayWriters[entity.EntityID] = ow
 	}
 
 	modelPath := envOr("MODEL_PATH", "data/yolo26s.onnx")
@@ -252,6 +309,61 @@ func loadOrInitFleet(path string) (*shared.FleetConfig, error) {
 	return fleet, nil
 }
 
+// guidedEnvInit prompts for required environment variables and writes them to .env.
+func guidedEnvInit() error {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println()
+	fmt.Println("=== Pulsar .env Setup ===")
+	fmt.Println("  Required environment variables are missing.")
+	fmt.Println()
+
+	baseURL := prompt(reader, "C4_BASE_URL (Overwatch API URL)", "http://localhost:8080")
+	apiKey := promptRequired(reader, "C4_API_KEY (Overwatch API key)")
+	natsKey := prompt(reader, "C4_NATS_KEY (NATS credential, leave blank to skip)", "")
+
+	if natsKey == "" {
+		fmt.Println("  ⚠ Warning: C4_NATS_KEY is empty — NATS streaming will not work without it.")
+	}
+
+	// Build .env content
+	var lines []string
+	lines = append(lines, fmt.Sprintf("C4_BASE_URL=%s", baseURL))
+	lines = append(lines, fmt.Sprintf("C4_API_KEY=%s", apiKey))
+	if natsKey != "" {
+		lines = append(lines, fmt.Sprintf("C4_NATS_KEY=%s", natsKey))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+
+	if err := os.WriteFile(".env", []byte(content), 0600); err != nil {
+		return fmt.Errorf("write .env: %w", err)
+	}
+
+	// Set in current process so the rest of main continues
+	os.Setenv("C4_BASE_URL", baseURL)
+	os.Setenv("C4_API_KEY", apiKey)
+	if natsKey != "" {
+		os.Setenv("C4_NATS_KEY", natsKey)
+	}
+
+	logger.Infof("[pulsar] wrote .env with C4_BASE_URL=%s", baseURL)
+	fmt.Println()
+	return nil
+}
+
+// promptRequired re-prompts until a non-empty value is entered.
+func promptRequired(reader *bufio.Reader, label string) string {
+	for {
+		fmt.Printf("  %s: ", label)
+		line, _ := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+		fmt.Println("  This field is required. Please enter a value.")
+	}
+}
+
 // guidedInit walks the user through first-time setup.
 func guidedInit() (*shared.FleetConfig, error) {
 	reader := bufio.NewReader(os.Stdin)
@@ -261,8 +373,8 @@ func guidedInit() (*shared.FleetConfig, error) {
 	fmt.Println()
 
 	orgName := prompt(reader, "Organization name", "GCS Alpha Station")
-	fmt.Println("  Organization types: military, civilian, commercial, ngo")
-	orgType := prompt(reader, "Organization type", "civilian")
+	fmt.Println("  Organization types: military (mil), civilian (civ), commercial (company), ngo (nonprofit)")
+	orgType := promptValidated(reader, "Organization type", "civilian", shared.IsValidOrgType)
 	orgDesc := prompt(reader, "Description (optional)", "Rapid response ground control station")
 
 	countStr := prompt(reader, "How many entities to register?", "1")
@@ -272,7 +384,14 @@ func guidedInit() (*shared.FleetConfig, error) {
 	}
 
 	fmt.Println()
-	fmt.Println("  Entity types: uav, isr_sensor, camera, ground_vehicle, boat, fixed_wing")
+	fmt.Println("  Entity types:")
+	fmt.Println("    Aircraft:  uav, fixed_wing, vtol, helicopter, airship")
+	fmt.Println("    Ground:    ground_vehicle, wheeled, tracked")
+	fmt.Println("    Maritime:  boat, usv, submarine, auv")
+	fmt.Println("    Sensors:   isr_sensor, sensor, camera, payload")
+	fmt.Println("    Stations:  gcs, operator")
+	fmt.Println("    Zones:     waypoint, no_fly_zone, geofence")
+	fmt.Println()
 	fmt.Println("  Priorities: low, normal, high, critical")
 	fmt.Println()
 
@@ -281,8 +400,8 @@ func guidedInit() (*shared.FleetConfig, error) {
 		fmt.Printf("--- Entity %d of %d ---\n", i+1, count)
 
 		name := prompt(reader, "  Entity name", fmt.Sprintf("Entity %d", i+1))
-		eType := prompt(reader, "  Entity type", "uav")
-		priority := prompt(reader, "  Priority", "normal")
+		eType := promptValidated(reader, "  Entity type", "uav", shared.IsValidEntityType)
+		priority := promptValidated(reader, "  Priority", "normal", shared.IsValidPriority)
 
 		var mavlink *shared.MavlinkConfig
 		mavEnable := prompt(reader, fmt.Sprintf("  Enable MAVLink telemetry? (y/n, ports auto-assigned from %d)", shared.MavlinkBasePort()), "y")
@@ -377,4 +496,15 @@ func prompt(reader *bufio.Reader, label, defaultVal string) string {
 		return defaultVal
 	}
 	return line
+}
+
+// promptValidated re-prompts until the value passes the validator function.
+func promptValidated(reader *bufio.Reader, label, defaultVal string, valid func(string) bool) string {
+	for {
+		val := prompt(reader, label, defaultVal)
+		if valid(val) {
+			return val
+		}
+		fmt.Printf("  Invalid value %q. Please try again.\n", val)
+	}
 }

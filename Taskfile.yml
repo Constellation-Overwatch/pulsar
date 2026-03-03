@@ -39,11 +39,11 @@ tasks:
 
   # ── Detection Build ─────────────────────────────────────────────────
   build:detection:
-    desc: Build with CV detection + device capture enabled
+    desc: Build with detection support (same binary, needs ONNX_LIB_PATH + MODEL_PATH at runtime)
     cmds:
-      - echo "Building {{.BINARY_NAME}} with detection tag..."
-      - CGO_ENABLED=1 go build -tags detection -o bin/{{.BINARY_NAME}} ./cmd/microlith
-      - echo "Built bin/{{.BINARY_NAME}} (detection enabled)"
+      - echo "Building {{.BINARY_NAME}} with detection..."
+      - go build -o bin/{{.BINARY_NAME}} ./cmd/microlith
+      - echo "Built bin/{{.BINARY_NAME}} (detection enabled via ONNX_LIB_PATH at runtime)"
 
   ensure:model:
     desc: Download YOLO26 ONNX if not present
@@ -71,7 +71,7 @@ tasks:
       ONNX_LIB_PATH: "{{.ONNX_LIB}}"
       MODEL_FORMAT: e2e
     cmds:
-      - CGO_ENABLED=1 go run -tags detection ./cmd/microlith
+      - go run ./cmd/microlith
 
   # ── Setup ───────────────────────────────────────────────────────────
   setup:deps:
@@ -180,10 +180,10 @@ tasks:
       - echo ""
       - |
         echo -n "  Build test:   "
-        if CGO_ENABLED=1 go build -tags detection -o /dev/null ./cmd/microlith 2>/dev/null; then
-          echo "PASS (detection tag compiles)"
+        if go build -o /dev/null ./cmd/microlith 2>/dev/null; then
+          echo "PASS (compiles)"
         else
-          echo "FAIL (detection tag does not compile)"
+          echo "FAIL (does not compile)"
         fi
 
   # ── Docker ──────────────────────────────────────────────────────────

@@ -1,5 +1,3 @@
-//go:build detection
-
 package detector
 
 import (
@@ -7,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"math"
 	"os"
 	"strconv"
@@ -14,13 +13,12 @@ import (
 	"time"
 
 	"github.com/Constellation-Overwatch/pulsar/pkg/services/logger"
-
 	"github.com/Constellation-Overwatch/pulsar/pkg/services/publisher"
 	"github.com/Constellation-Overwatch/pulsar/pkg/services/video"
 	"github.com/Constellation-Overwatch/pulsar/pkg/shared"
+	"github.com/disintegration/imaging"
 	"github.com/google/uuid"
-	ort "github.com/yalue/onnxruntime_go"
-	"gocv.io/x/gocv"
+	"github.com/shota3506/onnxruntime-purego/onnxruntime"
 )
 
 const (
@@ -31,6 +29,10 @@ const (
 	trackMatchDist   = 0.08 // 8% of frame size
 	processEveryN    = 5
 	maxE2EDetections = 300 // YOLO26 e2e head max detections per image
+
+	captureWidth  = 1280
+	captureHeight = 720
+	captureFPS    = 15
 )
 
 var defaultClasses = []string{"drone", "quadcopter", "airplane", "helicopter", "bird", "person"}
@@ -90,82 +92,51 @@ type trackedObject struct {
 }
 
 // StartDetector starts YOLOE detection on video sources for each entity with video config.
-// For device cameras, the detector opens them directly (no RTSP round-trip).
-// For RTSP sources, it reads from the RTSP URL.
-// modelPath is the path to the ONNX model file, onnxLibPath is the optional ONNX runtime library path.
-// overlayWriters maps entity_id → OverlayWriter for publishing annotated frames.
+// Detection is runtime-optional: if the ONNX runtime library is not available, it logs
+// a message and returns without error. Similarly, ffmpeg must be available for video capture.
 func StartDetector(ctx context.Context, entities []shared.EntityState, orgID string, pub *publisher.OverwatchPublisher, modelPath, onnxLibPath string, overlayWriters map[string]*video.OverlayWriter) {
-	if onnxLibPath != "" {
-		ort.SetSharedLibraryPath(onnxLibPath)
+	if onnxLibPath == "" {
+		logger.Info("[detector] ONNX_LIB_PATH not set, detection disabled")
+		return
 	}
-	if err := ort.InitializeEnvironment(); err != nil {
-		logger.Errorf("[detector] failed to init ONNX runtime: %v (skipping detection)", err)
+
+	rt, err := onnxruntime.NewRuntime(onnxLibPath, 23)
+	if err != nil {
+		logger.Infof("[detector] ONNX runtime not available (%v), detection disabled", err)
 		return
 	}
 
 	started := 0
 	for _, entity := range entities {
-		// Resolve video source: prefer device camera (direct) over RTSP (round-trip)
 		videoSource := resolveVideoSource(entity)
 		if videoSource == "" {
 			continue
 		}
 		overlay := overlayWriters[entity.EntityID]
-		go runDetectorForEntity(ctx, entity, videoSource, orgID, modelPath, pub, overlay)
+		go runDetectorForEntity(ctx, rt, entity, videoSource, orgID, modelPath, pub, overlay)
 		started++
 	}
 	if started > 0 {
 		logger.Infof("[detector] started %d YOLOE detector(s)", started)
 	}
+
+	// Keep runtime alive until context is cancelled, then close it.
+	// The goroutines above hold references to sessions created from this runtime.
+	go func() {
+		<-ctx.Done()
+		rt.Close()
+	}()
 }
 
-// resolveVideoSource returns the best video source for the detector.
-// Device cameras are preferred (direct access, no RTSP round-trip).
-// Falls back to the RTSP URL for network sources.
+// resolveVideoSource returns the RTSP URL for the detector to read from.
+// The video bridge publishes all sources (RTSP and device) to MediaMTX,
+// so the detector always reads from the entity's RTSP path.
 func resolveVideoSource(entity shared.EntityState) string {
-	if dev := video.ResolveDeviceSource(entity); dev != "" {
-		return dev
-	}
 	return entity.RTSPURL
 }
 
-func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoSource, orgID, modelPath string, pub *publisher.OverwatchPublisher, overlay *video.OverlayWriter) {
-	isDevice := video.ResolveDeviceSource(entity) != ""
-	if isDevice {
-		logger.Infof("[detector] %s: opening device %s directly (no RTSP round-trip)", entity.Name, videoSource)
-	} else {
-		logger.Infof("[detector] %s: opening RTSP %s", entity.Name, videoSource)
-	}
-
-	// Retry loop: device or RTSP source may still be starting up.
-	const maxRetries = 10
-	const retryInterval = 2 * time.Second
-
-	var cap *gocv.VideoCapture
-	var err error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		cap, err = gocv.OpenVideoCapture(videoSource)
-		if err == nil {
-			break
-		}
-		if attempt == maxRetries {
-			logger.Errorf("[detector] failed to open %s after %d attempts: %v", videoSource, maxRetries, err)
-			return
-		}
-		logger.Warnf("[detector] source not ready for %s, retrying (%d/%d)...", entity.Name, attempt, maxRetries)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(retryInterval):
-		}
-	}
-	defer cap.Close()
-
-	// Set camera resolution for direct device capture
-	if isDevice {
-		cap.Set(gocv.VideoCaptureFrameWidth, 1280)
-		cap.Set(gocv.VideoCaptureFrameHeight, 720)
-	}
+func runDetectorForEntity(ctx context.Context, rt *onnxruntime.Runtime, entity shared.EntityState, videoSource, orgID, modelPath string, pub *publisher.OverwatchPublisher, overlay *video.OverlayWriter) {
+	logger.Infof("[detector] %s: opening RTSP %s", entity.Name, videoSource)
 
 	// Detect model format: "e2e" for YOLO26 (default), "legacy" for YOLOv8/YOLO11
 	modelFormat := "e2e"
@@ -178,69 +149,44 @@ func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoS
 		modelSource = "hf"
 	}
 
-	inputShape := ort.NewShape(1, 3, int64(inputSize), int64(inputSize))
-	input, err := ort.NewEmptyTensor[float32](inputShape)
+	// Create ONNX environment and session
+	env, err := rt.NewEnv("pulsar-detector", onnxruntime.LoggingLevelWarning)
 	if err != nil {
-		logger.Errorf("[detector] input tensor error: %v", err)
+		logger.Errorf("[detector] ONNX env error: %v", err)
 		return
 	}
-	defer input.Destroy()
+	defer env.Close()
 
-	var session *ort.AdvancedSession
-	var postprocessFn func() []rawDetection
+	session, err := rt.NewSession(env, modelPath, nil)
+	if err != nil {
+		logger.Errorf("[detector] ONNX session error: %v", err)
+		return
+	}
+	defer session.Close()
+
+	inputNames := session.InputNames()
+	outputNames := session.OutputNames()
+
 	var numClasses int
+	var postprocessFn func(outputs map[string]*onnxruntime.Value) []rawDetection
 
 	switch {
 	case modelFormat == "e2e" && modelSource == "hf":
 		// HuggingFace community: pixel_values -> logits (1,300,80) + pred_boxes (1,300,4)
 		numClasses = len(cocoClasses)
-		logitsOutput, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(maxE2EDetections), int64(numClasses)))
-		if err != nil {
-			logger.Errorf("[detector] logits tensor error: %v", err)
-			return
-		}
-		defer logitsOutput.Destroy()
-
-		boxesOutput, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(maxE2EDetections), 4))
-		if err != nil {
-			logger.Errorf("[detector] boxes tensor error: %v", err)
-			return
-		}
-		defer boxesOutput.Destroy()
-
-		session, err = ort.NewAdvancedSession(modelPath,
-			[]string{"pixel_values"}, []string{"logits", "pred_boxes"},
-			[]ort.ArbitraryTensor{input}, []ort.ArbitraryTensor{logitsOutput, boxesOutput}, nil)
-		if err != nil {
-			logger.Errorf("[detector] ONNX session error: %v", err)
-			return
-		}
-
 		nc := numClasses
-		postprocessFn = func() []rawDetection {
-			return postprocessHF(logitsOutput.GetData(), boxesOutput.GetData(), nc)
+		postprocessFn = func(outputs map[string]*onnxruntime.Value) []rawDetection {
+			logitsData, _, _ := onnxruntime.GetTensorData[float32](outputs[outputNames[0]])
+			boxesData, _, _ := onnxruntime.GetTensorData[float32](outputs[outputNames[1]])
+			return postprocessHF(logitsData, boxesData, nc)
 		}
 
 	case modelFormat == "e2e":
 		// Ultralytics export: images -> output0 (1,300,6) [x1,y1,x2,y2,score,class_id]
 		numClasses = len(cocoClasses)
-		output, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(maxE2EDetections), 6))
-		if err != nil {
-			logger.Errorf("[detector] output tensor error: %v", err)
-			return
-		}
-		defer output.Destroy()
-
-		session, err = ort.NewAdvancedSession(modelPath,
-			[]string{"images"}, []string{"output0"},
-			[]ort.ArbitraryTensor{input}, []ort.ArbitraryTensor{output}, nil)
-		if err != nil {
-			logger.Errorf("[detector] ONNX session error: %v", err)
-			return
-		}
-
-		postprocessFn = func() []rawDetection {
-			return postprocessE2E(output.GetData())
+		postprocessFn = func(outputs map[string]*onnxruntime.Value) []rawDetection {
+			data, _, _ := onnxruntime.GetTensorData[float32](outputs[outputNames[0]])
+			return postprocessE2E(data)
 		}
 
 	default:
@@ -251,27 +197,12 @@ func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoS
 		if numClasses <= 0 {
 			numClasses = len(defaultClasses)
 		}
-		output, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(4+numClasses), 8400))
-		if err != nil {
-			logger.Errorf("[detector] output tensor error: %v", err)
-			return
-		}
-		defer output.Destroy()
-
-		session, err = ort.NewAdvancedSession(modelPath,
-			[]string{"images"}, []string{"output0"},
-			[]ort.ArbitraryTensor{input}, []ort.ArbitraryTensor{output}, nil)
-		if err != nil {
-			logger.Errorf("[detector] ONNX session error: %v", err)
-			return
-		}
-
 		nc := numClasses
-		postprocessFn = func() []rawDetection {
-			return postprocess(output.GetData(), nc)
+		postprocessFn = func(outputs map[string]*onnxruntime.Value) []rawDetection {
+			data, _, _ := onnxruntime.GetTensorData[float32](outputs[outputNames[0]])
+			return postprocess(data, nc)
 		}
 	}
-	defer session.Destroy()
 
 	logger.Infof("[detector] %s: model loaded (source=%s, format=%s, classes=%d)", entity.Name, modelSource, modelFormat, numClasses)
 
@@ -304,8 +235,6 @@ func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoS
 		}
 	}
 
-	frame := gocv.NewMat()
-	defer frame.Close()
 	var frameCount int64
 	var lastDetections []rawDetection // cached from last YOLO run
 
@@ -329,28 +258,81 @@ func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoS
 		}
 	}()
 
+	// Outer loop: (re)connect to the RTSP source. The bridge may still be
+	// starting up or the source may drop — we retry indefinitely until the
+	// context is cancelled.
+	const maxConnRetries = 30
+	const connRetryInterval = 3 * time.Second
+
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 
-		if ok := cap.Read(&frame); !ok || frame.Empty() {
-			time.Sleep(100 * time.Millisecond)
-			continue
+		var reader *FrameReader
+		var err error
+		for attempt := 1; attempt <= maxConnRetries; attempt++ {
+			reader, err = NewFrameReader(ctx, videoSource, captureWidth, captureHeight, captureFPS)
+			if err == nil {
+				break
+			}
+			if attempt == maxConnRetries {
+				logger.Errorf("[detector] failed to open %s after %d attempts: %v", videoSource, maxConnRetries, err)
+				return
+			}
+			logger.Warnf("[detector] source not ready for %s, retrying (%d/%d)...", entity.Name, attempt, maxConnRetries)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(connRetryInterval):
+			}
 		}
-		frameCount++
+
+		// Inner loop: read frames until error/EOF, then reconnect
+		for {
+			select {
+			case <-ctx.Done():
+				reader.Close()
+				return
+			default:
+			}
+
+			frame, err := reader.Read()
+			if err != nil {
+				reader.Close()
+				logger.Warnf("[detector] %s: stream interrupted (%v), reconnecting...", entity.Name, err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				break // break inner loop to reconnect in outer loop
+			}
+			frameCount++
 
 		// Run YOLO inference every Nth frame only
 		if frameCount%processEveryN == 0 {
 			preprocessed := preprocess(frame)
-			copy(input.GetData(), preprocessed)
 
-			if err := session.Run(); err != nil {
+			inputTensor, err := onnxruntime.NewTensorValue(rt, preprocessed, []int64{1, 3, int64(inputSize), int64(inputSize)})
+			if err != nil {
+				logger.Errorf("[detector] input tensor error: %v", err)
+				continue
+			}
+
+			inputs := map[string]*onnxruntime.Value{
+				inputNames[0]: inputTensor,
+			}
+			outputs, err := session.Run(ctx, inputs, onnxruntime.WithOutputNames(outputNames...))
+			inputTensor.Close()
+
+			if err != nil {
 				logger.Errorf("[detector] inference error: %v", err)
 			} else {
-				detections := postprocessFn()
+				detections := postprocessFn(outputs)
+				for _, v := range outputs {
+					v.Close()
+				}
 				lastDetections = detections
 
 				mu.Lock()
@@ -383,64 +365,51 @@ func runDetectorForEntity(ctx context.Context, entity shared.EntityState, videoS
 
 		// Write EVERY frame to overlay for smooth video (15fps).
 		// Draw cached detections from the last YOLO run.
-		// At 15fps, x264 produces keyframes every ~1s so WebRTC
-		// consumers can start decoding immediately.
 		if overlay != nil {
 			if len(lastDetections) > 0 {
-				annotated := frame.Clone()
-				drawDetections(&annotated, lastDetections)
+				annotated := drawDetections(frame, lastDetections)
 				if err := overlay.WriteFrame(annotated); err != nil {
 					logger.Errorf("[detector] overlay write error for %s: %v", entity.Name, err)
 				}
-				annotated.Close()
 			} else {
 				if err := overlay.WriteFrame(frame); err != nil {
 					logger.Errorf("[detector] overlay write error for %s: %v", entity.Name, err)
 				}
 			}
 		}
-	}
+		} // end inner frame-read loop
+	} // end outer reconnect loop
 }
 
 // --- Preprocessing ---
 
-func preprocess(img gocv.Mat) []float32 {
-	// Letterbox resize to inputSize x inputSize
-	h, w := img.Rows(), img.Cols()
+func preprocess(img image.Image) []float32 {
+	bounds := img.Bounds()
+	h, w := bounds.Dy(), bounds.Dx()
 	scale := float64(inputSize) / math.Max(float64(h), float64(w))
 	newH, newW := int(float64(h)*scale), int(float64(w)*scale)
 
-	resized := gocv.NewMat()
-	defer resized.Close()
-	gocv.Resize(img, &resized, image.Point{X: newW, Y: newH}, 0, 0, gocv.InterpolationLinear)
+	// Resize to fit within inputSize x inputSize
+	resized := imaging.Resize(img, newW, newH, imaging.Linear)
 
-	padded := gocv.NewMatWithSize(inputSize, inputSize, gocv.MatTypeCV8UC3)
-	defer padded.Close()
-	padded.SetTo(gocv.NewScalar(114, 114, 114, 0))
+	// Create padded image with gray (114,114,114) fill
+	padded := imaging.New(inputSize, inputSize, color.NRGBA{R: 114, G: 114, B: 114, A: 255})
 
+	// Paste resized into center of padded
 	padY, padX := (inputSize-newH)/2, (inputSize-newW)/2
-	roi := padded.Region(image.Rect(padX, padY, padX+newW, padY+newH))
-	resized.CopyTo(&roi)
-	roi.Close()
+	padded = imaging.Paste(padded, resized, image.Pt(padX, padY))
 
-	// BGR -> RGB
-	rgb := gocv.NewMat()
-	defer rgb.Close()
-	gocv.CvtColor(padded, &rgb, gocv.ColorBGRToRGB)
-
-	// Float32, normalize to [0, 1]
-	floatMat := gocv.NewMat()
-	defer floatMat.Close()
-	rgb.ConvertTo(&floatMat, gocv.MatTypeCV32F)
-	floatMat.DivideFloat(255.0)
-
-	// HWC -> NCHW
-	channels := gocv.Split(floatMat)
+	// Extract NCHW float32 normalized to [0, 1]
+	// Go images are already RGB, no BGR conversion needed
 	result := make([]float32, 3*inputSize*inputSize)
-	for c, ch := range channels {
-		data, _ := ch.DataPtrFloat32()
-		copy(result[c*inputSize*inputSize:], data)
-		ch.Close()
+	for y := 0; y < inputSize; y++ {
+		for x := 0; x < inputSize; x++ {
+			r, g, b, _ := padded.At(x, y).RGBA()
+			idx := y*inputSize + x
+			result[0*inputSize*inputSize+idx] = float32(r>>8) / 255.0 // R channel
+			result[1*inputSize*inputSize+idx] = float32(g>>8) / 255.0 // G channel
+			result[2*inputSize*inputSize+idx] = float32(b>>8) / 255.0 // B channel
+		}
 	}
 	return result
 }
@@ -730,42 +699,27 @@ func buildDetectionsForKV(tracks map[string]*trackedObject, frameCount int64) *p
 	}
 }
 
-func buildEntityDetectionState(entityID string, tracks map[string]*trackedObject, frameCount int64) EntityDetectionState {
-	var dets []DetectionEvent
-	for _, t := range tracks {
-		dets = append(dets, DetectionEvent{
-			EntityID:   entityID,
-			TrackID:    t.ID,
-			Label:      t.Label,
-			Confidence: t.Confidence,
-			Timestamp:  t.LastSeen,
-		})
-	}
-	return EntityDetectionState{
-		EntityID:   entityID,
-		Status:     "online",
-		IsLive:     true,
-		Detections: dets,
-		FrameCount: frameCount,
-		UpdatedAt:  time.Now().UTC(),
-	}
-}
+// --- Overlay Drawing (pure Go, no GoCV) ---
 
-// --- Overlay Drawing ---
-
-// classColors maps detection labels to BGR colors for bounding boxes.
+// classColors maps detection labels to RGB colors for bounding boxes.
 var classColors = map[string]color.RGBA{
-	"drone":       {R: 0, G: 0, B: 255, A: 255},   // red
-	"quadcopter":  {R: 0, G: 0, B: 255, A: 255},   // red
-	"airplane":    {R: 255, G: 0, B: 0, A: 255},    // blue
-	"helicopter":  {R: 255, G: 255, B: 0, A: 255},  // cyan
-	"bird":        {R: 0, G: 255, B: 0, A: 255},    // green
-	"person":      {R: 0, G: 255, B: 255, A: 255},  // yellow
+	"drone":      {R: 255, G: 0, B: 0, A: 255},     // red
+	"quadcopter": {R: 255, G: 0, B: 0, A: 255},     // red
+	"airplane":   {R: 0, G: 0, B: 255, A: 255},     // blue
+	"helicopter": {R: 0, G: 255, B: 255, A: 255},   // cyan
+	"bird":       {R: 0, G: 255, B: 0, A: 255},     // green
+	"person":     {R: 255, G: 255, B: 0, A: 255},   // yellow
 }
 
-func drawDetections(frame *gocv.Mat, detections []rawDetection) {
-	h := float64(frame.Rows())
-	w := float64(frame.Cols())
+// drawDetections renders bounding boxes and labels onto the image.
+// Returns a new *image.NRGBA with annotations drawn.
+func drawDetections(img image.Image, detections []rawDetection) *image.NRGBA {
+	bounds := img.Bounds()
+	h := float64(bounds.Dy())
+	w := float64(bounds.Dx())
+
+	// Clone the image to draw on
+	dst := imaging.Clone(img)
 
 	for _, d := range detections {
 		// Convert normalized coords to pixel coords
@@ -779,12 +733,141 @@ func drawDetections(frame *gocv.Mat, detections []rawDetection) {
 			c = color.RGBA{R: 255, G: 255, B: 255, A: 255} // white default
 		}
 
-		rect := image.Rect(x1, y1, x2, y2)
-		gocv.Rectangle(frame, rect, c, 2)
+		// Draw bounding box using 4 thin filled rectangles (2px thick)
+		thickness := 2
+		uni := image.NewUniform(c)
+		// Top edge
+		draw.Draw(dst, image.Rect(x1, y1, x2, y1+thickness), uni, image.Point{}, draw.Over)
+		// Bottom edge
+		draw.Draw(dst, image.Rect(x1, y2-thickness, x2, y2), uni, image.Point{}, draw.Over)
+		// Left edge
+		draw.Draw(dst, image.Rect(x1, y1, x1+thickness, y2), uni, image.Point{}, draw.Over)
+		// Right edge
+		draw.Draw(dst, image.Rect(x2-thickness, y1, x2, y2), uni, image.Point{}, draw.Over)
 
+		// Draw label background
 		label := fmt.Sprintf("%s %.0f%%", d.label, d.confidence*100)
-		gocv.PutText(frame, label, image.Pt(x1, y1-6), gocv.FontHersheyPlain, 1.2, c, 2)
+		labelW := len(label) * 7 // approximate character width
+		labelH := 14
+		bgRect := image.Rect(x1, y1-labelH-2, x1+labelW+4, y1)
+		draw.Draw(dst, bgRect, uni, image.Point{}, draw.Over)
+
+		// Draw label text using simple pixel font
+		drawString(dst, label, x1+2, y1-labelH, color.RGBA{R: 255, G: 255, B: 255, A: 255})
 	}
+	return dst
+}
+
+// drawString renders a string onto an NRGBA image using a minimal 5x7 bitmap font.
+// This avoids any dependency on freetype, x/image/font, or external font files.
+func drawString(img *image.NRGBA, s string, x, y int, c color.RGBA) {
+	for _, ch := range s {
+		glyph := getGlyph(byte(ch))
+		for gy := 0; gy < 7; gy++ {
+			for gx := 0; gx < 5; gx++ {
+				if glyph[gy]&(1<<(4-gx)) != 0 {
+					px, py := x+gx, y+gy
+					if px >= 0 && py >= 0 && px < img.Bounds().Dx() && py < img.Bounds().Dy() {
+						img.SetNRGBA(px, py, color.NRGBA{R: c.R, G: c.G, B: c.B, A: c.A})
+					}
+				}
+			}
+		}
+		x += 7 // character width + spacing
+	}
+}
+
+// getGlyph returns a 5x7 bitmap for basic ASCII characters.
+func getGlyph(ch byte) [7]byte {
+	switch {
+	case ch >= 'A' && ch <= 'Z':
+		return uppercaseGlyphs[ch-'A']
+	case ch >= 'a' && ch <= 'z':
+		return lowercaseGlyphs[ch-'a']
+	case ch >= '0' && ch <= '9':
+		return digitGlyphs[ch-'0']
+	case ch == ' ':
+		return [7]byte{}
+	case ch == '%':
+		return [7]byte{0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03}
+	case ch == '_':
+		return [7]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F}
+	case ch == '.':
+		return [7]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04}
+	default:
+		return [7]byte{0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x0A} // checkerboard for unknown
+	}
+}
+
+var uppercaseGlyphs = [26][7]byte{
+	{0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11}, // A
+	{0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}, // B
+	{0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}, // C
+	{0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}, // D
+	{0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}, // E
+	{0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}, // F
+	{0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}, // G
+	{0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, // H
+	{0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, // I
+	{0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C}, // J
+	{0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, // K
+	{0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}, // L
+	{0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}, // M
+	{0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}, // N
+	{0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // O
+	{0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}, // P
+	{0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}, // Q
+	{0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}, // R
+	{0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E}, // S
+	{0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, // T
+	{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // U
+	{0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04}, // V
+	{0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}, // W
+	{0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}, // X
+	{0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}, // Y
+	{0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}, // Z
+}
+
+var lowercaseGlyphs = [26][7]byte{
+	{0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F}, // a
+	{0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E}, // b
+	{0x00, 0x00, 0x0E, 0x11, 0x10, 0x11, 0x0E}, // c
+	{0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F}, // d
+	{0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E}, // e
+	{0x06, 0x09, 0x08, 0x1C, 0x08, 0x08, 0x08}, // f
+	{0x00, 0x00, 0x0F, 0x11, 0x0F, 0x01, 0x0E}, // g
+	{0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11}, // h
+	{0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E}, // i
+	{0x02, 0x00, 0x06, 0x02, 0x02, 0x12, 0x0C}, // j
+	{0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12}, // k
+	{0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, // l
+	{0x00, 0x00, 0x1A, 0x15, 0x15, 0x11, 0x11}, // m
+	{0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11}, // n
+	{0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E}, // o
+	{0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10}, // p
+	{0x00, 0x00, 0x0F, 0x11, 0x0F, 0x01, 0x01}, // q
+	{0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10}, // r
+	{0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E}, // s
+	{0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06}, // t
+	{0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D}, // u
+	{0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04}, // v
+	{0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A}, // w
+	{0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11}, // x
+	{0x00, 0x00, 0x11, 0x11, 0x0F, 0x01, 0x0E}, // y
+	{0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F}, // z
+}
+
+var digitGlyphs = [10][7]byte{
+	{0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, // 0
+	{0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}, // 1
+	{0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, // 2
+	{0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E}, // 3
+	{0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, // 4
+	{0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}, // 5
+	{0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}, // 6
+	{0x1F, 0x01, 0x02, 0x04, 0x04, 0x04, 0x04}, // 7
+	{0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, // 8
+	{0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}, // 9
 }
 
 func parseTimeOrNow(s string) time.Time {

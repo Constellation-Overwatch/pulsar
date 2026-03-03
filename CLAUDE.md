@@ -15,11 +15,11 @@ task dev                # Build and run without detection (go run ./cmd/microlit
 task build              # Build binary to bin/pulsar (no detection)
 task run                # Build + run binary
 
-task build:detection    # Build with CGO_ENABLED=1 -tags detection
-task dev:detection      # Dev mode with detection (needs ONNX + OpenCV)
+task build:detection    # Build binary (detection enabled via ONNX_LIB_PATH at runtime)
+task dev:detection      # Dev mode with detection (needs ONNX Runtime + ffmpeg)
 task run:detection      # Build + run with detection
 
-task setup:deps         # Install OpenCV + ONNX Runtime (macOS/Homebrew)
+task setup:deps         # Install ONNX Runtime (macOS/Homebrew)
 task setup:model        # Download YOLO26 ONNX from HuggingFace
 task setup:all          # Full detection setup (deps + model)
 
@@ -48,8 +48,8 @@ go test -run TestRegister_FirstBoot ./pkg/services/registry/...  # Single test
 - **registry/** — Overwatch API registration and reconciliation logic. Uses `pkg/shared/client.go` (HTTP client with 3-attempt retry). This is the core orchestration service.
 - **relay/** — Per-entity MAVLink UDP listeners. Parses frames and dispatches to publisher.
 - **publisher/** — NATS JetStream publishing on `constellation.telemetry.{entity_id}.{msg_type}` + KV state aggregation in `CONSTELLATION_GLOBAL_STATE` bucket.
-- **video/** — RTSP server (auto-detects MediaMTX or falls back to embedded gortsplib), video source bridging, detection overlay rendering.
-- **detector/** — YOLO26 ONNX inference with object tracking. Build-tag gated (`-tags detection`); `detector_noop.go` provides silent no-op stubs when compiled without the tag.
+- **video/** — RTSP server (auto-detects MediaMTX or falls back to embedded gortsplib), ffmpeg-based source bridging (publishes sources to MediaMTX), ffmpeg-based overlay rendering (annotated frames → RTSP).
+- **detector/** — YOLO26 ONNX inference with object tracking via onnxruntime-purego (no CGO). Runtime-optional: disabled when ONNX_LIB_PATH is not set.
 
 **Shared types** in `pkg/shared/`:
 - `config.go` — Fleet/C4 types, YAML unmarshaling (supports `mavlink: true` and `mavlink: {port: N}`), entity type mapping (e.g., `uav` → `aircraft_multirotor`), MAVLink port resolution.
@@ -58,7 +58,7 @@ go test -run TestRegister_FirstBoot ./pkg/services/registry/...  # Single test
 
 ## Key Patterns
 
-- **Build tag isolation:** Detection/CV code is gated behind `//go:build detection`. The default build compiles without CGO or CV dependencies. No-op stubs in `*_noop.go` files ensure graceful degradation.
+- **CGO-free build:** All code compiles with `CGO_ENABLED=0`. Detection uses onnxruntime-purego (dlopen at runtime), video uses ffmpeg subprocesses. No build tags needed.
 - **Dual video hosts:** `RTSP_HOST` (local, for bridge/detector) vs `ADVERTISE_HOST` (external, registered with Overwatch). Registry generates advertised endpoints — never sends `fleet.yaml` video_config to Overwatch directly.
 - **MAVLink port assignment:** Explicit ports reserved first, then auto-assigned ports fill sequentially from `MAVLINK_BASE_PORT` (default 14550), skipping conflicts.
 - **Config hashing:** The sync loop hashes `fleet.yaml` to detect changes, re-registering and restarting services only when config actually changes.
@@ -77,7 +77,7 @@ Tests use `httptest.NewServer` with a `mockOverwatch` that simulates the full Ov
 
 ## Dependencies
 
-Go 1.25. Key libraries: `gomavlib/v3` (MAVLink), `gortsplib/v5` (embedded RTSP), `nats.go` + `jetstream` (NATS), `yaml.v3`, `gocv` + `onnxruntime_go` (detection, optional).
+Go 1.25. Key libraries: `gomavlib/v3` (MAVLink), `gortsplib/v5` (embedded RTSP), `nats.go` + `jetstream` (NATS), `yaml.v3`, `onnxruntime-purego` (ONNX inference, no CGO), `disintegration/imaging` (image processing). Runtime: `ffmpeg` (video source bridging, H264 encoding, overlay publishing), `libonnxruntime` dylib/so (detection inference).
 
 ## Go Best Practices
 

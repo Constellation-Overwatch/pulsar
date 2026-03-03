@@ -15,7 +15,19 @@ import (
 
 // Register performs idempotent org + entity registration against Overwatch.
 // Uses previousState (from c4.json) to track entities by entity_id across restarts.
-func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey, natsURL, rtspHost, advertiseHost string, previousState *shared.C4State) (*shared.C4State, error) {
+// RegisterOptions holds optional flags that modify registration behavior.
+type RegisterOptions struct {
+	// ForceVideoSync forces a video endpoint update on all entities,
+	// even if fleet config hasn't drifted. Use when ADVERTISE_HOST or
+	// ADVERTISE_HTTPS changes in .env.
+	ForceVideoSync bool
+}
+
+func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey, natsURL, rtspHost, advertiseHost string, advertiseHTTPS bool, previousState *shared.C4State, opts ...RegisterOptions) (*shared.C4State, error) {
+	var opt RegisterOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	// 1. Health check
 	logger.Info("[pulsar] checking overwatch health...")
 	health, err := client.HealthCheck()
@@ -100,11 +112,12 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 			if ec.VideoConfig == nil {
 				return nil
 			}
-			return shared.FormatVideoEndpoints(advertiseHost, rtspPort, entityID)
+			return shared.FormatVideoEndpoints(advertiseHost, rtspPort, entityID, advertiseHTTPS)
 		}
 
 		// Create or update entity on Overwatch
-		if entity != nil && needsDriftUpdate(entity, ec, apiType) {
+		drifted := entity != nil && needsDriftUpdate(entity, ec, apiType)
+		if drifted {
 			advertisedVC = buildAdvertisedVC(entity.EntityID)
 			logger.Infof("[pulsar] drift detected for %q (id: %s), updating...", ec.Name, entity.EntityID)
 			updated, err := client.UpdateEntity(org.OrgID, entity.EntityID, shared.UpdateEntityRequest{
@@ -144,10 +157,14 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 					logger.Warnf("[pulsar] failed to set video endpoints for %q: %v", ec.Name, err)
 				}
 			}
-		} else if advertisedVC == nil && ec.VideoConfig != nil {
-			// Entity exists and isn't drifted, but ensure video endpoints are set
+		} else if !drifted && ec.VideoConfig != nil && (advertisedVC == nil || opt.ForceVideoSync) {
+			// Entity exists, no fleet drift, but video endpoints need syncing:
+			// either first time (advertisedVC == nil) or env changed (ForceVideoSync)
 			advertisedVC = buildAdvertisedVC(entity.EntityID)
 			if advertisedVC != nil {
+				if opt.ForceVideoSync {
+					logger.Infof("[pulsar] force-syncing video endpoints for %q", ec.Name)
+				}
 				if _, err := client.UpdateEntity(org.OrgID, entity.EntityID, shared.UpdateEntityRequest{
 					VideoConfig: advertisedVC,
 				}); err != nil {
@@ -180,14 +197,15 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 		}
 
 		registeredEntities = append(registeredEntities, shared.EntityState{
-			EntityID:    entity.EntityID,
-			Name:        entity.Name,
-			Type:        entity.EntityType,
-			StreamPath:  entity.EntityID,
-			RTSPURL:     rtspURL,
-			MavlinkPort: mavlinkPort,
-			VideoConfig: ec.VideoConfig, // local ingest config (device/source)
-			VideoSource: videoSource,
+			EntityID:        entity.EntityID,
+			Name:            entity.Name,
+			Type:            entity.EntityType,
+			StreamPath:      entity.EntityID,
+			RTSPURL:         rtspURL,
+			MavlinkPort:     mavlinkPort,
+			VideoConfig:     ec.VideoConfig, // local ingest config (device/source)
+			VideoSource:     videoSource,
+			AdvertisedVideo: advertisedVC,   // what was pushed to Overwatch
 		})
 
 		logger.Infof("[pulsar] entity: %s [%s] (id: %s) -> %s", entity.Name, entity.EntityType, entity.EntityID, rtspURL)
@@ -224,14 +242,17 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 	}
 
 	state := &shared.C4State{
-		PulsarID:     pulsarID,
-		OrgID:        org.OrgID,
-		OrgName:      org.Name,
-		APIURL:       client.BaseURL,
-		NATSKey:      natsKey,
-		NATSURL:      natsURL,
-		Entities:     registeredEntities,
-		RegisteredAt: time.Now().UTC(),
+		PulsarID:       pulsarID,
+		OrgID:          org.OrgID,
+		OrgName:        org.Name,
+		APIURL:         client.BaseURL,
+		NATSKey:        natsKey,
+		NATSURL:        natsURL,
+		AdvertiseHost:  advertiseHost,
+		AdvertiseHTTPS: advertiseHTTPS,
+		RTSPHost:       rtspHost,
+		Entities:       registeredEntities,
+		RegisteredAt:   time.Now().UTC(),
 	}
 
 	return state, nil
@@ -335,6 +356,20 @@ func FleetConfigHash(path string) (string, error) {
 	}
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h), nil
+}
+
+// EnvFileHash returns a sha256 hash of the .env file for change detection.
+// Returns empty string if the file doesn't exist (not an error).
+func EnvFileHash(paths ...string) string {
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		h := sha256.Sum256(data)
+		return fmt.Sprintf("%x", h)
+	}
+	return ""
 }
 
 // LoadC4State loads previous c4.json state for entity_id tracking.

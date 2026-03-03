@@ -3,6 +3,7 @@ package shared
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,25 +70,29 @@ func (m *MavlinkConfig) UnmarshalYAML(value *yaml.Node) error {
 
 // C4State is the c4.json output file structure.
 type C4State struct {
-	PulsarID     string        `json:"pulsar_id"`
-	OrgID        string        `json:"org_id"`
-	OrgName      string        `json:"org_name"`
-	APIURL       string        `json:"api_url"`
-	NATSKey      string        `json:"nats_key"`
-	NATSURL      string        `json:"nats_url"`
-	Entities     []EntityState `json:"entities"`
-	RegisteredAt time.Time     `json:"registered_at"`
+	PulsarID       string        `json:"pulsar_id"`
+	OrgID          string        `json:"org_id"`
+	OrgName        string        `json:"org_name"`
+	APIURL         string        `json:"api_url"`
+	NATSKey        string        `json:"nats_key"`
+	NATSURL        string        `json:"nats_url"`
+	AdvertiseHost  string        `json:"advertise_host"`
+	AdvertiseHTTPS bool          `json:"advertise_https"`
+	RTSPHost       string        `json:"rtsp_host"`
+	Entities       []EntityState `json:"entities"`
+	RegisteredAt   time.Time     `json:"registered_at"`
 }
 
 type EntityState struct {
-	EntityID    string                 `json:"entity_id"`
-	Name        string                 `json:"name"`
-	Type        string                 `json:"type"`
-	StreamPath  string                 `json:"stream_path"`
-	RTSPURL     string                 `json:"rtsp_url"`
-	MavlinkPort int                    `json:"mavlink_port,omitempty"`
-	VideoConfig map[string]interface{} `json:"video_config,omitempty"`
-	VideoSource string                 `json:"video_source,omitempty"`
+	EntityID          string                 `json:"entity_id"`
+	Name              string                 `json:"name"`
+	Type              string                 `json:"type"`
+	StreamPath        string                 `json:"stream_path"`
+	RTSPURL           string                 `json:"rtsp_url"`
+	MavlinkPort       int                    `json:"mavlink_port,omitempty"`
+	VideoConfig       map[string]interface{} `json:"video_config,omitempty"`
+	VideoSource       string                 `json:"video_source,omitempty"`
+	AdvertisedVideo   map[string]interface{} `json:"advertised_video,omitempty"`
 }
 
 // orgTypeMap maps friendly fleet.yaml names to API org_type enum values.
@@ -147,6 +152,61 @@ func ResolveEntityType(t string) string {
 		return mapped
 	}
 	return lower
+}
+
+// validPriorities defines the accepted priority values.
+var validPriorities = map[string]bool{
+	"low":      true,
+	"normal":   true,
+	"high":     true,
+	"critical": true,
+}
+
+// IsValidEntityType returns true if t is a recognized entity type alias.
+func IsValidEntityType(t string) bool {
+	_, ok := entityTypeMap[strings.ToLower(strings.TrimSpace(t))]
+	return ok
+}
+
+// IsValidOrgType returns true if t is a recognized organization type alias.
+func IsValidOrgType(t string) bool {
+	_, ok := orgTypeMap[strings.ToLower(strings.TrimSpace(t))]
+	return ok
+}
+
+// IsValidPriority returns true if t is a recognized priority value.
+func IsValidPriority(t string) bool {
+	return validPriorities[strings.ToLower(strings.TrimSpace(t))]
+}
+
+// ValidEntityTypes returns all recognized entity type aliases, sorted.
+func ValidEntityTypes() []string {
+	keys := make([]string, 0, len(entityTypeMap))
+	for k := range entityTypeMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ValidOrgTypes returns all recognized org type aliases, sorted.
+func ValidOrgTypes() []string {
+	keys := make([]string, 0, len(orgTypeMap))
+	for k := range orgTypeMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ValidPriorities returns all recognized priority values, sorted.
+func ValidPriorities() []string {
+	keys := make([]string, 0, len(validPriorities))
+	for k := range validPriorities {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // MavlinkBasePort returns the base port from MAVLINK_BASE_PORT env (default 14550).

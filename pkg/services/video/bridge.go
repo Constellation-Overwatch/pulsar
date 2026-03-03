@@ -2,74 +2,63 @@ package video
 
 import (
 	"context"
-	"strings"
 
 	"github.com/Constellation-Overwatch/pulsar/pkg/services/logger"
 	"github.com/Constellation-Overwatch/pulsar/pkg/shared"
 )
 
-// StartBridge configures video source proxying for all entities with video sources.
-// In MediaMTX mode, it configures source proxy paths via the API.
-// In embedded mode, RTSP sources are read directly by the detector (no proxy needed).
+// StartBridge publishes video sources to the RTSP server via ffmpeg subprocesses.
+// For each entity with a video source (RTSP URL or device), it spawns an ffmpeg
+// process that reads from the source and publishes to the RTSP server at
+// /{entity_id}. This makes the raw stream available on MediaMTX for both
+// downstream consumers and the detector.
 //
-// For each entity with a video source, it also configures the overlay path
-// ({entity_id}/pulsar) for the detector to publish annotated frames.
-//
-// Returns a cleanup function that removes configured paths.
+// Returns a cleanup function that stops all publishers.
 func StartBridge(ctx context.Context, state *shared.C4State, srv *RTSPServer) func() {
 	if srv.Mode() == "none" {
 		logger.Info("[video] no RTSP server available, skipping video bridge")
 		return func() {}
 	}
 
+	var publishers []*SourcePublisher
 	bridged := 0
 
-	for i, entity := range state.Entities {
-		source := resolveVideoSource(entity)
-
-		switch srv.Mode() {
-		case "mediamtx":
-			if source != "" {
-				// MediaMTX auto-creates paths when clients publish/connect.
-				// Just track which sources are bridged for logging.
-				logger.Infof("[video] %s: source %s -> /%s (mediamtx)", entity.Name, source, entity.EntityID)
-				bridged++
-			}
-
-		case "embedded":
-			if source != "" && strings.HasPrefix(source, "rtsp://") {
-				// Embedded mode: detector reads directly from source URL
-				// Update the entity's RTSPURL so the detector knows where to read
-				state.Entities[i].RTSPURL = source
-				logger.Infof("[video] %s: detector will read directly from %s (embedded mode)", entity.Name, source)
-				bridged++
-			}
-			// For device sources, bridge_device.go handles capture → embedded server
-			// Overlay path is implicit on embedded server (created on first ANNOUNCE)
+	for _, entity := range state.Entities {
+		source := resolveSource(entity)
+		if source == "" {
+			continue
 		}
+
+		pub := StartSourcePublisher(ctx, source, entity.EntityID, srv.rtspHost, srv.rtspPort)
+		publishers = append(publishers, pub)
+		bridged++
 	}
 
 	if bridged > 0 {
-		logger.Infof("[video] bridge configured %d source(s) (%s mode)", bridged, srv.Mode())
+		logger.Infof("[bridge] publishing %d source(s) to %s RTSP server", bridged, srv.Mode())
 	}
 
-	// Start device captures (gocv-dependent, behind detection build tag)
-	deviceCleanup := startDeviceCaptures(ctx, state.Entities, srv)
-
 	return func() {
-		deviceCleanup()
-		logger.Infof("[video] bridge cleaned up")
+		for _, p := range publishers {
+			p.Close()
+		}
+		if bridged > 0 {
+			logger.Info("[bridge] all source publishers stopped")
+		}
 	}
 }
 
-// resolveVideoSource extracts the source URL from entity video_config.
-// Priority: video_config["source"] > empty (device handled separately)
-func resolveVideoSource(entity shared.EntityState) string {
+// resolveSource returns the video source for an entity.
+// Checks video_config["source"] (RTSP URL) first, then video_config["device"].
+func resolveSource(entity shared.EntityState) string {
 	if entity.VideoConfig == nil {
 		return ""
 	}
 	if src, ok := entity.VideoConfig["source"].(string); ok && src != "" {
 		return src
+	}
+	if dev, ok := entity.VideoConfig["device"].(string); ok && dev != "" {
+		return dev
 	}
 	return ""
 }

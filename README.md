@@ -24,7 +24,7 @@ Pulsar is the edge sync agent that connects ground control stations to [Constell
 
 ## Features
 
-* **Guided First-Time Setup** — interactive terminal wizard generates `config/fleet.yaml` when no config exists
+* **Guided First-Time Setup** — interactive terminal wizard generates `.env` (when credentials are missing) and `config/fleet.yaml` (when no config exists), with input validation
 * **Declarative Fleet Config** — define entities in `config/fleet.yaml`, Pulsar handles registration and reconciliation
 * **Idempotent Registration** — entity UUIDs tracked in `config/c4.json` across restarts, no duplicates
 * **MAVLink Relay** — 1:1 UDP listeners per entity with auto-assigned sequential ports
@@ -133,14 +133,39 @@ cp config/fleet.example.yaml config/fleet.yaml
 task dev
 ```
 
-On first run with no `config/fleet.yaml`, Pulsar walks you through setup:
+On first run with no `.env`, Pulsar prompts for credentials:
+
+```text
+=== Pulsar .env Setup ===
+  Required environment variables are missing.
+
+  C4_BASE_URL (Overwatch API URL) [http://localhost:8080]: https://overwatch.example.com
+  C4_API_KEY (Overwatch API key): c4_prod_abc123
+  C4_NATS_KEY (NATS credential, leave blank to skip): NATS_SEED_XYZ
+
+[pulsar] wrote .env with C4_BASE_URL=https://overwatch.example.com
+[pulsar] derived NATS URL: nats://overwatch.example.com:4222 (from C4_BASE_URL)
+```
+
+Then, with no `config/fleet.yaml`, it walks you through fleet setup with validated inputs:
 
 ```text
 === Pulsar First-Time Setup ===
 
   Organization name [GCS Alpha Station]:
+  Organization types: military (mil), civilian (civ), commercial (company), ngo (nonprofit)
   Organization type [civilian]:
   How many entities to register? [1]: 3
+
+  Entity types:
+    Aircraft:  uav, fixed_wing, vtol, helicopter, airship
+    Ground:    ground_vehicle, wheeled, tracked
+    Maritime:  boat, usv, submarine, auv
+    Sensors:   isr_sensor, sensor, camera, payload
+    Stations:  gcs, operator
+    Zones:     waypoint, no_fly_zone, geofence
+
+  Priorities: low, normal, high, critical
 
 --- Entity 1 of 3 ---
   Entity name [Entity 1]: Primary UAV
@@ -199,7 +224,7 @@ This generates `config/fleet.yaml` and registers with Overwatch. MAVLink ports a
 | `C4_API_KEY` | Yes | — | Overwatch API bearer token |
 | `C4_BASE_URL` | Yes | — | Overwatch API URL (e.g. `http://localhost:8080`) |
 | `C4_NATS_KEY` | Yes | — | NATS nkey seed for JetStream auth |
-| `C4_NATS_URL` | No | `nats://localhost:4222` | NATS server URL |
+| `C4_NATS_URL` | No | Derived from `C4_BASE_URL` host | NATS server URL (auto-derived as `nats://{host}:4222` if not set) |
 | `MAVLINK_BASE_PORT` | No | `14550` | Starting port for auto-assigned MAVLink listeners |
 | `FLEET_CONFIG` | No | `config/fleet.yaml` | Path to fleet config file |
 | `C4_STATE_FILE` | No | `config/c4.json` | Path to state file |
@@ -251,9 +276,19 @@ entities:
     # no mavlink key = no listener
 ```
 
-**Entity types:** `uav`, `fixed_wing`, `vtol`, `helicopter`, `airship`, `ground_vehicle`, `boat`, `isr_sensor`, `camera`, `gcs`
+**Entity types:**
+| Category | Types |
+| --- | --- |
+| Aircraft | `uav`, `fixed_wing`, `vtol`, `helicopter`, `airship` |
+| Ground | `ground_vehicle`, `wheeled`, `tracked` |
+| Maritime | `boat`, `usv`, `submarine`, `auv` |
+| Sensors | `isr_sensor`, `sensor`, `camera`, `payload` |
+| Stations | `gcs`, `operator` |
+| Zones | `waypoint`, `no_fly_zone`, `geofence` |
 
-**Organization types:** `military`, `civilian`, `commercial`, `ngo`
+**Organization types:** `military` (mil), `civilian` (civ), `commercial` (company), `ngo` (nonprofit)
+
+**Priorities:** `low`, `normal`, `high`, `critical`
 
 ### MAVLink Port Assignment
 
