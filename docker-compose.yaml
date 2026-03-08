@@ -1,0 +1,28 @@
+services:
+  pulsar:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RTSP_HOST: mediamtx
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      # ADVERTISE_HOST: 10.0.1.50  # set to your host's reachable IP
+    volumes:
+      - ./config:/app/config
+    network_mode: host
+    depends_on:
+      mediamtx:
+        condition: service_started
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Allow any source to publish without credentials
+      MTX_PROTOCOLS: tcp
+    # Ports exposed (via network_mode: host):
+    #   8554  - RTSP
+    #   8889  - WebRTC
+    #   8888  - HLS
+    #   9997  - API

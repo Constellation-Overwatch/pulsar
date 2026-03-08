@@ -428,18 +428,41 @@ pulsar/
 └── .goreleaser.yaml               # Release configuration
 ```
 
-## Docker
+## Deployment
+
+### MediaMTX (Required for Browser Video)
+
+Pulsar auto-detects MediaMTX for WebRTC/HLS streaming. Without it, only RTSP TCP clients (ffplay, VLC) work.
+
+**Option A — Native install:**
+
+```bash
+task setup:mediamtx     # install MediaMTX
+task mediamtx           # runs on :8554 (RTSP), :8889 (WebRTC), :8888 (HLS)
+```
+
+**Option B — Docker:**
+
+```bash
+docker run -d --name mediamtx --network host bluenviron/mediamtx:latest
+```
+
+Then run Pulsar normally — it discovers MediaMTX via `MEDIAMTX_API_URL` (default `http://localhost:9997`).
+
+### Docker
 
 ```bash
 # Build
 task docker-build
 
-# Run (mount .env and config)
-docker run --env-file .env -v $(pwd)/config:/app/config pulsar:latest
+# Run standalone
+docker run --env-file .env --network host -v $(pwd)/config:/app/config pulsar:latest
 
-# Or with Docker Compose
-task docker-run
+# Or with Docker Compose (Pulsar + MediaMTX sidecar)
+docker-compose up -d
 ```
+
+> Set `ADVERTISE_HOST` to your host's reachable IP when deploying — auto-discovery can pick the wrong interface in containers.
 
 ## Development
 
