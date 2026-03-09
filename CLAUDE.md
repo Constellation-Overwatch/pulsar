@@ -22,6 +22,7 @@ task run:detection      # Build + run with detection
 task setup:deps         # Install ONNX Runtime (macOS/Homebrew)
 task setup:model        # Download YOLO26 ONNX from HuggingFace
 task setup:all          # Full detection setup (deps + model)
+task setup:mediamtx     # Install MediaMTX (cross-platform: brew on macOS, binary on Linux)
 
 task docker-build       # Build Docker image
 task docker-run         # docker-compose up -d

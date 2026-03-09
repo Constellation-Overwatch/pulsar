@@ -116,11 +116,58 @@ tasks:
       - mediamtx
 
   setup:mediamtx:
-    desc: Install MediaMTX via Homebrew (macOS)
-    platforms: [darwin]
+    desc: Install MediaMTX (auto-detects OS and architecture)
+    vars:
+      MEDIAMTX_VERSION: v1.16.3
     cmds:
-      - brew install mediamtx
-      - echo "MediaMTX installed. Run 'task mediamtx' in a separate terminal."
+      - |
+        if command -v mediamtx >/dev/null 2>&1; then
+          echo "MediaMTX already installed: $(mediamtx --version 2>/dev/null || echo 'unknown version')"
+          echo "Run 'task mediamtx' in a separate terminal."
+          exit 0
+        fi
+
+        OS="$(uname -s)"
+        ARCH="$(uname -m)"
+
+        # macOS: prefer Homebrew
+        if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+          echo "Installing MediaMTX via Homebrew..."
+          brew install mediamtx
+          echo "MediaMTX installed. Run 'task mediamtx' in a separate terminal."
+          exit 0
+        fi
+
+        # Map OS
+        case "$OS" in
+          Darwin) OS_TAG="darwin" ;;
+          Linux)  OS_TAG="linux" ;;
+          *)      echo "Unsupported OS: $OS"; exit 1 ;;
+        esac
+
+        # Map architecture
+        case "$ARCH" in
+          x86_64)  ARCH_TAG="amd64" ;;
+          aarch64) ARCH_TAG="arm64" ;;
+          arm64)   ARCH_TAG="arm64" ;;
+          armv7l)  ARCH_TAG="armv7" ;;
+          armv6l)  ARCH_TAG="armv6" ;;
+          *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+
+        TARBALL="mediamtx_{{.MEDIAMTX_VERSION}}_${OS_TAG}_${ARCH_TAG}.tar.gz"
+        URL="https://github.com/bluenviron/mediamtx/releases/download/{{.MEDIAMTX_VERSION}}/${TARBALL}"
+
+        echo "Downloading MediaMTX {{.MEDIAMTX_VERSION}} (${OS_TAG}/${ARCH_TAG})..."
+        curl -L --progress-bar -o "/tmp/${TARBALL}" "$URL"
+
+        echo "Installing to /usr/local/bin/mediamtx..."
+        tar -xzf "/tmp/${TARBALL}" -C /tmp mediamtx
+        sudo mv /tmp/mediamtx /usr/local/bin/mediamtx
+        sudo chmod +x /usr/local/bin/mediamtx
+        rm -f "/tmp/${TARBALL}"
+
+        echo "MediaMTX {{.MEDIAMTX_VERSION}} installed. Run 'task mediamtx' in a separate terminal."
 
   # ── Testing Video ───────────────────────────────────────────────────
   test:video:
