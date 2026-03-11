@@ -11,6 +11,7 @@ import (
 	"github.com/Constellation-Overwatch/pulsar/pkg/shared"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // TelemetryEnvelope is the message format published to NATS JetStream.
@@ -28,6 +29,7 @@ type TelemetryEnvelope struct {
 
 // StartRelay starts MAVLink listeners for all entities that have mavlink config.
 // Accepts the full C4State so entity metadata (org_id, etc.) is available for KV publishing.
+// When a publisher is provided, entities with CommandsEnabled get a NATS command subscriber.
 func StartRelay(ctx context.Context, state *shared.C4State, pub *publisher.OverwatchPublisher) {
 	started := 0
 	for _, entity := range state.Entities {
@@ -43,7 +45,8 @@ func StartRelay(ctx context.Context, state *shared.C4State, pub *publisher.Overw
 			Status:     "active",
 			Priority:   "normal",
 		}
-		go runRelayForEntity(ctx, entity, meta, pub)
+		js := pub.JetStream()
+		go runRelayForEntity(ctx, entity, meta, pub, js)
 		started++
 	}
 	if started > 0 {
@@ -51,7 +54,7 @@ func StartRelay(ctx context.Context, state *shared.C4State, pub *publisher.Overw
 	}
 }
 
-func runRelayForEntity(ctx context.Context, entity shared.EntityState, meta publisher.EntityMeta, pub *publisher.OverwatchPublisher) {
+func runRelayForEntity(ctx context.Context, entity shared.EntityState, meta publisher.EntityMeta, pub *publisher.OverwatchPublisher, js jetstream.JetStream) {
 	logger.Infof("[relay] listening for %s on UDP :%d", entity.Name, entity.MavlinkPort)
 
 	node, err := gomavlib.NewNode(gomavlib.NodeConf{
@@ -71,6 +74,10 @@ func runRelayForEntity(ctx context.Context, entity shared.EntityState, meta publ
 		<-ctx.Done()
 		node.Close()
 	}()
+
+	if entity.CommandsEnabled && js != nil {
+		go runCommandSubscriber(ctx, node, entity, js)
+	}
 
 	for evt := range node.Events() {
 		if frm, ok := evt.(*gomavlib.EventFrame); ok {

@@ -218,6 +218,17 @@ func NewOverwatchPublisher(natsURL, natsKey, pulsarID string) (*OverwatchPublish
 		logger.Warnf("[nats] events stream: %v", err)
 	}
 
+	// Ensure commands stream (C2 forwarding)
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     "CONSTELLATION_COMMANDS",
+		Subjects: []string{"constellation.commands.>"},
+		Storage:  jetstream.FileStorage,
+		MaxAge:   1 * time.Hour,
+	})
+	if err != nil {
+		logger.Warnf("[nats] commands stream: %v", err)
+	}
+
 	// Ensure KV bucket for entity state
 	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:  "CONSTELLATION_GLOBAL_STATE",
@@ -412,6 +423,9 @@ func (p *OverwatchPublisher) DeleteKV(key string) error {
 	}
 	return p.kv.Delete(context.Background(), key)
 }
+
+// JetStream returns the underlying JetStream context for direct consumer creation.
+func (p *OverwatchPublisher) JetStream() jetstream.JetStream { return p.js }
 
 // Close gracefully drains and closes the NATS connection.
 func (p *OverwatchPublisher) Close() {

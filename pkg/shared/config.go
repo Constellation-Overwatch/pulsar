@@ -30,6 +30,7 @@ type EntityConfig struct {
 	Status      string                 `yaml:"status" json:"status"`
 	VideoConfig map[string]interface{} `yaml:"video_config" json:"video_config,omitempty"`
 	Mavlink     *MavlinkConfig         `yaml:"mavlink" json:"mavlink,omitempty"`
+	Commands    *bool                  `yaml:"commands" json:"commands,omitempty"`
 }
 
 type MavlinkConfig struct {
@@ -84,15 +85,16 @@ type C4State struct {
 }
 
 type EntityState struct {
-	EntityID          string                 `json:"entity_id"`
-	Name              string                 `json:"name"`
-	Type              string                 `json:"type"`
-	StreamPath        string                 `json:"stream_path"`
-	RTSPURL           string                 `json:"rtsp_url"`
-	MavlinkPort       int                    `json:"mavlink_port,omitempty"`
-	VideoConfig       map[string]interface{} `json:"video_config,omitempty"`
-	VideoSource       string                 `json:"video_source,omitempty"`
-	AdvertisedVideo   map[string]interface{} `json:"advertised_video,omitempty"`
+	EntityID        string                 `json:"entity_id"`
+	Name            string                 `json:"name"`
+	Type            string                 `json:"type"`
+	StreamPath      string                 `json:"stream_path"`
+	RTSPURL         string                 `json:"rtsp_url"`
+	MavlinkPort     int                    `json:"mavlink_port,omitempty"`
+	CommandsEnabled bool                   `json:"commands_enabled,omitempty"`
+	VideoConfig     map[string]interface{} `json:"video_config,omitempty"`
+	VideoSource     string                 `json:"video_source,omitempty"`
+	AdvertisedVideo map[string]interface{} `json:"advertised_video,omitempty"`
 }
 
 // orgTypeMap maps friendly fleet.yaml names to API org_type enum values.

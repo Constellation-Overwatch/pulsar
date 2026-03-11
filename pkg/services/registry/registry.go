@@ -196,6 +196,12 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 			}
 		}
 
+		// commands: only enable if both commands flag and mavlink are set
+		commandsEnabled := ec.Commands != nil && *ec.Commands && ec.Mavlink != nil
+		if ec.Commands != nil && *ec.Commands && ec.Mavlink == nil {
+			logger.Warnf("[pulsar] entity %q has commands: true but no mavlink config — commands disabled", ec.Name)
+		}
+
 		registeredEntities = append(registeredEntities, shared.EntityState{
 			EntityID:        entity.EntityID,
 			Name:            entity.Name,
@@ -203,6 +209,7 @@ func Register(client *shared.OverwatchClient, fleet *shared.FleetConfig, natsKey
 			StreamPath:      entity.EntityID,
 			RTSPURL:         rtspURL,
 			MavlinkPort:     mavlinkPort,
+			CommandsEnabled: commandsEnabled,
 			VideoConfig:     ec.VideoConfig, // local ingest config (device/source)
 			VideoSource:     videoSource,
 			AdvertisedVideo: advertisedVC,   // what was pushed to Overwatch

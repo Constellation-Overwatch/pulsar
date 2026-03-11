@@ -14,6 +14,7 @@ entities:
     priority: "high"
     status: "active"
     mavlink: true                        # auto-assigned UDP port
+    commands: true                       # enable C2 command forwarding via NATS
     video_config:
       protocol: "rtsp"
       port: 8554
@@ -25,6 +26,7 @@ entities:
     priority: "normal"
     status: "active"
     mavlink: true                        # auto-assigned next UDP port
+    commands: true                       # enable C2 command forwarding via NATS
     video_config:
       protocol: "rtsp"
       port: 8554

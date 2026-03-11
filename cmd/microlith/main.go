@@ -222,6 +222,9 @@ func printSummary(state *shared.C4State, statePath string) {
 		if e.MavlinkPort > 0 {
 			suffix = fmt.Sprintf(" | mavlink:%d", e.MavlinkPort)
 		}
+		if e.CommandsEnabled {
+			suffix += " | commands"
+		}
 		fmt.Printf("    - %s [%s] -> %s%s\n", e.Name, e.Type, e.RTSPURL, suffix)
 	}
 	fmt.Printf("  State file:     %s\n", statePath)
@@ -404,9 +407,16 @@ func guidedInit() (*shared.FleetConfig, error) {
 		priority := promptValidated(reader, "  Priority", "normal", shared.IsValidPriority)
 
 		var mavlink *shared.MavlinkConfig
+		var commands *bool
 		mavEnable := prompt(reader, fmt.Sprintf("  Enable MAVLink telemetry? (y/n, ports auto-assigned from %d)", shared.MavlinkBasePort()), "y")
 		if strings.EqualFold(mavEnable, "y") || strings.EqualFold(mavEnable, "yes") {
 			mavlink = &shared.MavlinkConfig{Protocol: "udp"}
+
+			cmdEnable := prompt(reader, "  Enable command forwarding (C2)? (y/n)", "n")
+			if strings.EqualFold(cmdEnable, "y") || strings.EqualFold(cmdEnable, "yes") {
+				t := true
+				commands = &t
+			}
 		}
 
 		var vc map[string]interface{}
@@ -435,6 +445,7 @@ func guidedInit() (*shared.FleetConfig, error) {
 			Status:      "active",
 			VideoConfig: vc,
 			Mavlink:     mavlink,
+			Commands:    commands,
 		})
 		fmt.Println()
 	}
@@ -442,6 +453,7 @@ func guidedInit() (*shared.FleetConfig, error) {
 	// Summary before saving
 	mavCount := 0
 	vidCount := 0
+	cmdCount := 0
 	for _, e := range entities {
 		if e.Mavlink != nil {
 			mavCount++
@@ -449,14 +461,20 @@ func guidedInit() (*shared.FleetConfig, error) {
 		if e.VideoConfig != nil {
 			vidCount++
 		}
+		if e.Commands != nil && *e.Commands {
+			cmdCount++
+		}
 	}
 	fmt.Println("=== Fleet Summary ===")
 	fmt.Printf("  Organization: %s (%s)\n", orgName, orgType)
-	fmt.Printf("  Entities:     %d total, %d with MAVLink, %d with video\n", len(entities), mavCount, vidCount)
+	fmt.Printf("  Entities:     %d total, %d with MAVLink, %d with video, %d with commands\n", len(entities), mavCount, vidCount, cmdCount)
 	for _, e := range entities {
 		streams := ""
 		if e.Mavlink != nil {
 			streams += " mavlink"
+		}
+		if e.Commands != nil && *e.Commands {
+			streams += " commands"
 		}
 		if e.VideoConfig != nil {
 			if src, ok := e.VideoConfig["source"].(string); ok && src != "" {
