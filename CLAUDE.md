@@ -73,7 +73,7 @@ go test -run TestRegister_FirstBoot ./pkg/services/registry/...  # Single test
 
 ## Testing
 
-Tests use `httptest.NewServer` with a `mockOverwatch` that simulates the full Overwatch API. Test cases cover: first boot creation, idempotent re-registration, drift detection/update, stale entity removal, re-provisioning after external deletion, adding new entities, and config hashing.
+Tests use `httptest.NewServer` with a `mockOverwatch` that simulates the full Overwatch API. Test cases cover: first boot creation, idempotent re-registration, drift detection/update, orphaned entity removal, re-provisioning after external deletion, adding new entities, and config hashing.
 
 ## Dependencies
 
@@ -87,7 +87,7 @@ Follow the [Zen of Go](https://bitfieldconsulting.com/posts/go-right-way) when w
 Keep `main.go` minimal — delegate business logic to packages in `pkg/services/` and `pkg/shared/`. Packages should return data, not print. Avoid `panic` in library code. Maintain flat module structure to prevent import cycles.
 
 ### 2. Test Everything
-Tests are a design tool. Write small, focused tests examining single behaviors through public APIs. Use `httptest.NewServer` for HTTP mocks (see `registry_test.go`). Cover: happy path, idempotent re-runs, drift detection, cleanup of stale state.
+Tests are a design tool. Write small, focused tests examining single behaviors through public APIs. Use `httptest.NewServer` for HTTP mocks (see `registry_test.go`). Cover: happy path, idempotent re-runs, drift detection, cleanup of orphaned state.
 
 ### 3. Write Code for Reading
 Prioritize clarity over cleverness. Use well-chosen names that convey purpose. Comments explain *why*, not *what*. Refactor until logic is obvious. Consistent naming across the codebase (e.g., `entity` not sometimes `device`/`drone`/`asset`).
